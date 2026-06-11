@@ -11,6 +11,10 @@ on:
         description: "TR rank"
         required: false
         default: "8"
+      hf_token:
+        description: "Your HF token (for gated models like Gemma/Llama). Leave blank to use repo secret."
+        required: false
+        default: ""
 
 env:
   HF_HUB_DISABLE_SYMLINKS_WARNING: 1
@@ -34,9 +38,16 @@ jobs:
           pip install -e .
         name: Install deps
 
-      - run: huggingface-cli login --token ${{ secrets.HF_TOKEN }} --add-to-git-credential
-        name: Login to HF (optional, for gated models)
-        continue-on-error: true
+      - name: Set HF token (for gated models like Gemma/Llama)
+        run: |
+          TOKEN="${{ inputs.hf_token }}"
+          if [ -z "$TOKEN" ]; then
+            TOKEN="${{ secrets.HF_TOKEN }}"
+          fi
+          if [ -n "$TOKEN" ]; then
+            echo "::add-mask::$TOKEN"
+            echo "HF_TOKEN=$TOKEN" >> $GITHUB_ENV
+          fi
 
       - run: |
           python evaluate_llm.py "${{ inputs.model }}" \
