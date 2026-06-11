@@ -1,0 +1,129 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  PYTHONUNBUFFERED: 1
+
+jobs:
+  bandit:
+    name: Static Analysis (bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          git init
+          git remote add origin https://github.com/${{ github.repository }}
+          git fetch --depth 1 origin ${{ github.sha }}
+          git checkout -b main ${{ github.sha }}
+        name: Checkout repo
+
+      - run: |
+          pip install bandit
+          bandit -r . -ll -o bandit_report.txt || true
+        name: Run bandit
+
+      - run: |
+          if [ -f bandit_report.txt ] && [ -s bandit_report.txt ]; then
+            echo "## Bandit Security Findings" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat bandit_report.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## Bandit: No security issues found" >> $GITHUB_STEP_SUMMARY
+          fi
+        name: Summary
+
+  pip-audit:
+    name: Dependency Audit (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          git init
+          git remote add origin https://github.com/${{ github.repository }}
+          git fetch --depth 1 origin ${{ github.sha }}
+          git checkout -b main ${{ github.sha }}
+        name: Checkout repo
+
+      - run: pip install pip-audit
+        name: Install pip-audit
+
+      - run: |
+          pip install -e .[hf,gguf,dev,docs]
+          pip freeze > pinned_requirements.txt
+        name: Install all deps
+
+      - run: |
+          pip-audit -r pinned_requirements.txt --desc on -o audit_report.json || true
+        name: Run pip-audit
+
+      - run: |
+          echo "## Dependency Vulnerability Report" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          if [ -f audit_report.json ] && [ -s audit_report.json ]; then
+            python -c "
+import json
+with open('audit_report.json') as f:
+    data = json.load(f)
+if isinstance(data, list):
+    for v in data:
+        print(f\"{v.get('name','?')} {v.get('version','?')} — {v.get('advisory','?')}\")
+else:
+    print(data)
+" 2>/dev/null || cat audit_report.json
+          else
+            echo "No known vulnerabilities found."
+          fi
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        name: Summary
+
+  secrets:
+    name: Secrets Detection (detect-secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          git init
+          git remote add origin https://github.com/${{ github.repository }}
+          git fetch --depth 1 origin ${{ github.sha }}
+          git checkout -b main ${{ github.sha }}
+        name: Checkout repo
+
+      - run: pip install detect-secrets
+        name: Install detect-secrets
+
+      - run: |
+          detect-secrets scan \
+            --exclude-files '.*\.pyc$' \
+            --exclude-files '\.git/.*' \
+            --exclude-files '\.hf_cache/.*' \
+            --exclude-files 'dist/.*' \
+            --exclude-files '__pycache__/.*' \
+            --exclude-files '.*\.egg-info/.*' \
+            --exclude-files 'docs/.*' \
+            > secrets_report.json || true
+        name: Scan for secrets
+
+      - run: |
+          echo "## Secrets Detection Report" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          python -c "
+import json
+with open('secrets_report.json') as f:
+    data = json.load(f)
+results = data.get('results', {})
+found = 0
+for file, secrets in results.items():
+    for s in secrets:
+        found += 1
+        print(f'{file}:{s.get(\"line_number\", \"?\")} — {s.get(\"type\", \"?\")}')
+if found == 0:
+    print('No secrets detected.')
+else:
+    print(f'\nTotal: {found} potential secret(s)')
+" 2>/dev/null || echo "No secrets report generated."
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        name: Summary
