@@ -34,6 +34,10 @@ jobs:
           pip install -e .
         name: Install deps
 
+      - run: huggingface-cli login --token ${{ secrets.HF_TOKEN }} --add-to-git-credential
+        name: Login to HF (optional, for gated models)
+        continue-on-error: true
+
       - run: |
           python evaluate_llm.py "${{ inputs.model }}" \
             --rank ${{ inputs.rank }} \
