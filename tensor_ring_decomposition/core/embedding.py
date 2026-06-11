@@ -919,6 +919,8 @@ class TensorRingEmbedding(nn.Module):
                     best_rank = r.item()
             
             return best_rank
+
+    def eigenspace_overlap_score(self, original_matrix: torch.Tensor, k: int = 10) -> float:
         """Compute Eigenspace Overlap Score (EOSk) between original and TR embedding.
 
         Measures how well the TR approximation preserves the top-k principal
