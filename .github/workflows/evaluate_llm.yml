@@ -6,12 +6,10 @@ on:
       model:
         description: "HF causal LM name (e.g., gpt2, facebook/opt-125m)"
         required: true
-        type: string
         default: "gpt2"
       rank:
         description: "TR rank"
         required: false
-        type: string
         default: "8"
 
 env:
@@ -22,35 +20,27 @@ jobs:
   evaluate:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - run: |
+          git init
+          git remote add origin https://github.com/${{ github.repository }}
+          git fetch --depth 1 origin ${{ github.sha }}
+          git checkout -b main ${{ github.sha }}
+        name: Checkout repo
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install dependencies
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install transformers huggingface_hub safetensors
           pip install -e .
+        name: Install deps
 
-      - name: Run evaluation
-        id: eval
-        run: |
+      - run: |
           python evaluate_llm.py "${{ inputs.model }}" \
             --rank ${{ inputs.rank }} \
             --output results.json
+        name: Run evaluation
 
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: llm-eval-results
-          path: results.json
-
-      - name: Summary
-        run: |
+      - run: |
           echo '## LLM Perplexity Evaluation' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           python -c "
@@ -59,7 +49,9 @@ jobs:
               d = json.load(f)
           print(f'Model: {d[\"model\"]} @ rank={d[\"rank\"]}')
           print(f'Params: {d[\"dense_parameters\"]:,} -> {d[\"tr_parameters\"]:,} ({d[\"compression_ratio\"]}x)')
-          print(f'Perplexity: {d[\"baseline_perplexity\"]} -> {d[\"compressed_perplexity\"]} ({d[\"perplexity_change_pct\"]:+.2f}%)')
+          pct = d['perplexity_change_pct']
+          print(f'Perplexity: {d[\"baseline_perplexity\"]} -> {d[\"compressed_perplexity\"]} ({pct:+.2f}%)')
           print(f'Recon error: {d[\"reconstruction_error_pct\"]}%')
           "
           echo '```' >> $GITHUB_STEP_SUMMARY
+        name: Summary

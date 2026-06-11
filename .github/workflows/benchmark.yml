@@ -4,14 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "HuggingFace model name (e.g., gpt2, bert-base-uncased)"
+        description: "HF model name (e.g., gpt2, bert-base-uncased)"
         required: true
-        type: string
         default: "gpt2"
       ranks:
-        description: "Comma-separated ranks to test"
+        description: "Comma-separated ranks"
         required: false
-        type: string
         default: "4,8,16,24,32,48"
 
 env:
@@ -22,50 +20,44 @@ jobs:
   benchmark:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - run: |
+          git init
+          git remote add origin https://github.com/${{ github.repository }}
+          git fetch --depth 1 origin ${{ github.sha }}
+          git checkout -b main ${{ github.sha }}
+        name: Checkout repo
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install dependencies
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install transformers huggingface_hub safetensors
           pip install -e .
+        name: Install deps
 
-      - name: Run compression benchmark
-        id: benchmark
-        run: |
+      - run: |
           python benchmark_hf.py "${{ inputs.model }}" \
             --ranks "${{ inputs.ranks }}" \
-            --output results.json \
-            --device cpu
+            --output results.json
+        name: Run benchmark
 
-      - name: Upload results
-        uses: actions/upload-artifact@v4
-        with:
-          name: benchmark-results
-          path: results.json
-
-      - name: Summary
-        run: |
-          echo '## Compression Benchmark Results' >> $GITHUB_STEP_SUMMARY
+      - run: |
+          echo '## Embedding Compression Benchmark' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           python -c "
           import json
           with open('results.json') as f:
               d = json.load(f)
-          m = d['model']
-          v, e = d['vocab_size'], d['embedding_dim']
-          print(f'Model: {m}  ({v}x{e})')
+          print(f'Model: {d[\"model\"]}  ({d[\"vocab_size\"]}x{d[\"embedding_dim\"]})')
           print(f'Dense params: {d[\"dense_parameters\"]:,}')
           print()
           print(f'{\"Rank\":>6} | {\"Compression\":>11} | {\"Params\":>10} | {\"ReconErr\":>8} | {\"EOS@10\":>7}')
           print(f'{\"-\"*6}-+-{\"-\"*11}-+-{\"-\"*10}-+-{\"-\"*8}-+-{\"-\"*7}')
           for r in d['results']:
-              print(f\"{r['rank']:>6} | {r['compression_ratio']:>6.1f}x{'':>4} | {r['num_parameters']:>10,} | {r['reconstruction_error_pct']:>7.1f}% | {r['eigenspace_overlap_k10']:>7.4f}\")
+              print(f\"{r['rank']:>6} | x{r['compression_ratio']:>7.1f}{'':>5} | {r['num_parameters']:>10,} | {r['reconstruction_error_pct']:>6.1f}% | {r['eigenspace_overlap_k10']:>7.4f}\")
           "
           echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "Results saved as artifact: results.json" >> $GITHUB_STEP_SUMMARY
+        name: Summary
+
+      - run: cat results.json
+        name: Print raw results
