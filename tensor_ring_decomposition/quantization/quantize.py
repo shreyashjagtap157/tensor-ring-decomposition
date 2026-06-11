@@ -180,13 +180,18 @@ class QuantizedTensorRingEmbedding(nn.Module):
 
     def _lsq_quantize_core(self, core: torch.Tensor, scale: nn.Parameter) -> torch.Tensor:
         """Apply LSQ quantization with learnable scale.
-
+        
         Forward: round(x / s) * s
         Gradient: pass through STE (identity on backward pass)
         Scale update: dL/ds approximation via STE
         """
-        q = torch.round(core / scale).clamp(-128, 127)
-        return q * scale
+        # Ensure scale is broadcastable to (dim, rank, rank)
+        s = scale
+        if s.ndim == 1:
+            s = s.view(-1, 1, 1)
+            
+        q = torch.round(core / s).clamp(-128, 127)
+        return q * s
 
     def quantize(self, embedding: "TensorRingEmbedding") -> None:
         """PTQ: Quantize all cores from a TR embedding to int8."""

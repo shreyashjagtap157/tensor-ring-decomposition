@@ -812,8 +812,9 @@ class TensorRingEmbedding(nn.Module):
 
             return error
 
+    @classmethod
     def spectral_gap_rank_suggestion(
-        self,
+        cls,
         matrix: torch.Tensor,
         ring_components: int = 4,
         variance_threshold: float = 0.9999,
