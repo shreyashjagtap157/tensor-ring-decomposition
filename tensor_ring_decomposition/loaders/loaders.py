@@ -208,28 +208,35 @@ def load_from_transformers(
     cache_dir: Optional[str] = None,
 ) -> torch.Tensor:
     """Load embedding weight from a HuggingFace Transformers model.
-
+    
     Args:
         model_name: HuggingFace model identifier (e.g., 'bert-base-uncased').
         device: Target device.
-        cache_dir: Optional cache directory for HF downloads.
-
+        cache_dir: Optional cache directory for HF downloads. If None, defaults to '.hf_cache' in project root.
+    
     Returns:
         Tensor of shape (vocab_size, embedding_dim).
     """
+    if cache_dir is None:
+        import os
+        # Ensure all downloads are contained within the project folder
+        project_root = os.getcwd()
+        cache_dir = os.path.join(project_root, ".hf_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+
     try:
         from transformers import AutoModel
     except ImportError:
         raise ImportError(
             "transformers package not found. Install with: pip install transformers"
         )
-
+    
     model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
     emb = model.get_input_embeddings()
     weight = emb.weight.data
-
+    
     logger.info(
-        f"Loaded '{model_name}' from HF: shape={tuple(weight.shape)}"
+        f"Loaded '{model_name}' from HF: shape={tuple(weight.shape)} (cached at {cache_dir})"
     )
     return weight.to(device) if device else weight
 

@@ -66,10 +66,21 @@ def compress(
     elif isinstance(source, str):
         profile = ModelRegistry.get(source)
         if profile is not None:
-            matrix = None  # will load from HF if needed
-        else:
+            # If a matrix-based init is requested, we MUST load the matrix from HF
+            if init_method in ("svd", "tr_svd", "als", "distribution_aware"):
+                try:
+                    matrix = load_embedding_matrix(source, device=device)
+                except Exception as e:
+                    logger.warning(f"Failed to load matrix for {source}: {e}. Falling back to uniform init.")
+                    # If loading fails, we force uniform init
+                    # We'll handle this by setting init_method to "uniform" below
+                
+        if profile is None:
             # Assume it's a file path or direct HF model name
-            matrix = load_embedding_matrix(source, device=device)
+            try:
+                matrix = load_embedding_matrix(source, device=device)
+            except Exception as e:
+                raise FileNotFoundError(f"Could not load embeddings from {source}: {e}")
     elif isinstance(source, torch.Tensor):
         matrix = source
     else:
@@ -103,17 +114,18 @@ def compress(
         logger.info(f"Autotune selected rank={rank}")
 
     # ── Build the embedding ──────────────────────────────────
-    if profile is not None:
-        # Profile-based: matrix not available, so default to uniform
-        actual_init = init_method if init_method != "svd" else "uniform"
-        emb = TensorRingEmbedding.from_profile(
-            profile, rank=rank, target_compression=target_compression,
-            init_method=actual_init, device=device, **kwargs,
-        )
-    elif matrix is not None:
+    if matrix is not None:
+        # Matrix available: use requested init_method
         emb = TensorRingEmbedding.from_pretrained(
             matrix, rank, ring_components=ring_components,
             init_method=init_method, device=device, **kwargs,
+        )
+    elif profile is not None:
+        # Profile only: must use random init
+        actual_init = init_method if init_method not in ("svd", "tr_svd", "als", "distribution_aware") else "uniform"
+        emb = TensorRingEmbedding.from_profile(
+            profile, rank=rank, target_compression=target_compression,
+            init_method=actual_init, device=device, **kwargs,
         )
     else:
         raise RuntimeError("Unexpected state: neither profile nor matrix available.")

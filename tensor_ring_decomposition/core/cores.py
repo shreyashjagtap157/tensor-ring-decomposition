@@ -158,7 +158,7 @@ class TensorRingCores(nn.Module):
 
     def _reconstruct_tr(self) -> torch.Tensor:
         """Reconstruct full matrix from current TR cores (no-graph, efficient).
-
+        
         ``compute_emb_precontraction`` returns (R, D, R). The ring-closure
         einsum ``vri,idr->vd`` expects voc: (V, R, R) × emb: (R, D, R) → (V, D).
         """
@@ -172,7 +172,9 @@ class TensorRingCores(nn.Module):
         emb = compute_emb_precontraction(list(self.emb_cores))
 
         result = torch.einsum("vri,idr->vd", voc, emb)
-        return result
+        
+        # Crop to original dimensions to handle padding
+        return result[:self.structure.original_vocab_size, :self.structure.original_embedding_dim]
 
     def _init_svd(self, matrix: torch.Tensor) -> None:
         """Initialize via sampled batch training to approximate target matrix.
@@ -192,9 +194,9 @@ class TensorRingCores(nn.Module):
         batch_size: int = 16384, input_probs: Optional[torch.Tensor] = None,
     ) -> None:
         """Train cores on sampled batches to approximate target embedding matrix.
-
+        
         Supports standard MSE loss and distribution-aware weighted loss.
-
+        
         Args:
             target: (V, D) target embedding matrix.
             steps: Number of training steps.
@@ -237,7 +239,8 @@ class TensorRingCores(nn.Module):
                 result = torch.bmm(result, cg)
             emb_cont = compute_emb_precontraction(list(self.emb_cores))
             output = ring_closure(result, emb_cont)
-            return output.reshape(-1, D)
+            # Crop to original embedding dimension
+            return output[..., :D].reshape(-1, D)
 
         def compute_loss(pred: torch.Tensor, tgt: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
             diff = pred - tgt
@@ -331,12 +334,23 @@ class TensorRingCores(nn.Module):
         SOTA fast fitting technique that solves the least-squares problem for each
         core sequentially. Converges much faster than SGD.
         """
+        # Pad target matrix to match padded dimensions of the ring structure
+        pV = self.structure.padded_vocab_size
+        pD = self.structure.padded_embedding_dim
+        V, D = target.shape
+        
+        if pV != V or pD != D:
+            padded_target = torch.zeros((pV, pD), device=target.device, dtype=target.dtype)
+            padded_target[:V, :D] = target
+        else:
+            padded_target = target
+
         dims = self.structure.vocab_factor_sizes + self.structure.emb_factor_sizes
         N = len(dims)
         ranks = self.structure.ranks
         
-        # Reshape target to N-dimensional tensor
-        W = target.reshape(*dims)
+        # Reshape padded target to N-dimensional tensor
+        W = padded_target.reshape(*dims)
         self._init_xavier("uniform")
         
         for sweep in range(sweeps):
