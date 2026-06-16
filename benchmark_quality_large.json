@@ -1,0 +1,124 @@
+{
+  "bert-large-uncased": {
+    "vocab_size": 30522,
+    "embedding_dim": 1024,
+    "results": [
+      {
+        "rank": 4,
+        "compression_ratio": 4718.4,
+        "tr_params": 6624,
+        "recon_pct": 100.0,
+        "da_err": 0.99999,
+        "eos_k10": 0.0116,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 5.6
+      },
+      {
+        "rank": 8,
+        "compression_ratio": 1179.6,
+        "tr_params": 26496,
+        "recon_pct": 100.04,
+        "da_err": 1.000435,
+        "eos_k10": 0.0088,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 5.9
+      },
+      {
+        "rank": 16,
+        "compression_ratio": 294.9,
+        "tr_params": 105984,
+        "recon_pct": 100.0,
+        "da_err": 1.000027,
+        "eos_k10": 0.009,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 13.3
+      },
+      {
+        "rank": 24,
+        "compression_ratio": 131.1,
+        "tr_params": 238464,
+        "recon_pct": 100.0,
+        "da_err": 1.0,
+        "eos_k10": 0.0091,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 34.0
+      },
+      {
+        "rank": 32,
+        "compression_ratio": 73.7,
+        "tr_params": 423936,
+        "recon_pct": 99.96,
+        "da_err": 0.999581,
+        "eos_k10": 0.0117,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 50.2
+      }
+    ]
+  },
+  "gpt2-medium": {
+    "vocab_size": 50257,
+    "embedding_dim": 1024,
+    "results": [
+      {
+        "rank": 4,
+        "compression_ratio": 6257.7,
+        "tr_params": 8224,
+        "recon_pct": 100.01,
+        "da_err": 1.000051,
+        "eos_k10": 0.0091,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 2.7
+      },
+      {
+        "rank": 8,
+        "compression_ratio": 1564.4,
+        "tr_params": 32896,
+        "recon_pct": 100.0,
+        "da_err": 1.000008,
+        "eos_k10": 0.0097,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 4.0
+      },
+      {
+        "rank": 16,
+        "compression_ratio": 391.1,
+        "tr_params": 131584,
+        "recon_pct": 100.05,
+        "da_err": 1.000482,
+        "eos_k10": 0.0118,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 8.2
+      },
+      {
+        "rank": 24,
+        "compression_ratio": 173.8,
+        "tr_params": 296064,
+        "recon_pct": 100.01,
+        "da_err": 1.000087,
+        "eos_k10": 0.0092,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 17.9
+      },
+      {
+        "rank": 32,
+        "compression_ratio": 97.8,
+        "tr_params": 526336,
+        "recon_pct": 100.02,
+        "da_err": 1.000236,
+        "eos_k10": 0.0096,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 40.6
+      }
+    ]
+  }
+}

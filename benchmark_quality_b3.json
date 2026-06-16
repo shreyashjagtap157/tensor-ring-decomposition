@@ -1,0 +1,185 @@
+{
+  "roberta-base": {
+    "vocab_size": 50265,
+    "embedding_dim": 768,
+    "results": [
+      {
+        "rank": 4,
+        "compression_ratio": 4777.7,
+        "tr_params": 8080,
+        "recon_pct": 100.0,
+        "da_err": 0.999991,
+        "eos_k10": 0.0137,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 4.2
+      },
+      {
+        "rank": 8,
+        "compression_ratio": 1194.4,
+        "tr_params": 32320,
+        "recon_pct": 100.0,
+        "da_err": 1.000049,
+        "eos_k10": 0.0123,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 4.3
+      },
+      {
+        "rank": 16,
+        "compression_ratio": 298.6,
+        "tr_params": 129280,
+        "recon_pct": 100.14,
+        "da_err": 1.001426,
+        "eos_k10": 0.0101,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 7.6
+      },
+      {
+        "rank": 24,
+        "compression_ratio": 132.7,
+        "tr_params": 290880,
+        "recon_pct": 100.08,
+        "da_err": 1.000757,
+        "eos_k10": 0.0146,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 14.0
+      },
+      {
+        "rank": 32,
+        "compression_ratio": 74.7,
+        "tr_params": 517120,
+        "recon_pct": 100.01,
+        "da_err": 1.000121,
+        "eos_k10": 0.0141,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 48.2
+      }
+    ]
+  },
+  "xlnet-base-cased": {
+    "vocab_size": 32000,
+    "embedding_dim": 768,
+    "results": [
+      {
+        "rank": 4,
+        "compression_ratio": 3692.3,
+        "tr_params": 6656,
+        "recon_pct": 100.0,
+        "da_err": 0.999971,
+        "eos_k10": 0.0143,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 3.3
+      },
+      {
+        "rank": 8,
+        "compression_ratio": 923.1,
+        "tr_params": 26624,
+        "recon_pct": 100.01,
+        "da_err": 1.000088,
+        "eos_k10": 0.0145,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 5.4
+      },
+      {
+        "rank": 16,
+        "compression_ratio": 230.8,
+        "tr_params": 106496,
+        "recon_pct": 99.98,
+        "da_err": 0.999772,
+        "eos_k10": 0.0125,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 11.3
+      },
+      {
+        "rank": 24,
+        "compression_ratio": 102.6,
+        "tr_params": 239616,
+        "recon_pct": 100.0,
+        "da_err": 0.999993,
+        "eos_k10": 0.0138,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 22.3
+      },
+      {
+        "rank": 32,
+        "compression_ratio": 57.7,
+        "tr_params": 425984,
+        "recon_pct": 99.95,
+        "da_err": 0.999497,
+        "eos_k10": 0.0176,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 50.3
+      }
+    ]
+  },
+  "distilbert-base-uncased": {
+    "vocab_size": 30522,
+    "embedding_dim": 768,
+    "results": [
+      {
+        "rank": 4,
+        "compression_ratio": 3608.5,
+        "tr_params": 6496,
+        "recon_pct": 100.0,
+        "da_err": 1.000013,
+        "eos_k10": 0.0118,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 3.7
+      },
+      {
+        "rank": 8,
+        "compression_ratio": 902.1,
+        "tr_params": 25984,
+        "recon_pct": 99.99,
+        "da_err": 0.999896,
+        "eos_k10": 0.0133,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 6.0
+      },
+      {
+        "rank": 16,
+        "compression_ratio": 225.5,
+        "tr_params": 103936,
+        "recon_pct": 100.0,
+        "da_err": 0.999987,
+        "eos_k10": 0.016,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 12.1
+      },
+      {
+        "rank": 24,
+        "compression_ratio": 100.2,
+        "tr_params": 233856,
+        "recon_pct": 99.94,
+        "da_err": 0.999417,
+        "eos_k10": 0.014,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 24.0
+      },
+      {
+        "rank": 32,
+        "compression_ratio": 56.4,
+        "tr_params": 415744,
+        "recon_pct": 100.02,
+        "da_err": 1.000201,
+        "eos_k10": 0.0131,
+        "trust": 1.0,
+        "cont": 1.0,
+        "time_s": 52.9
+      }
+    ]
+  }
+}
