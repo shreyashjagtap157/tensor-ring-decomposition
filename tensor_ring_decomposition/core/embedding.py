@@ -30,7 +30,7 @@ import torch.distributed as dist
 if TYPE_CHECKING:
     from ..models.registry import ModelProfile
 
-from .factorization import RingStructure, compute_ring_structure
+from .factorization import RingStructure, compute_ring_structure, compute_mixed_radix_strides
 from .cores import TensorRingCores
 from .contraction import (
     compute_emb_precontraction,
@@ -159,8 +159,8 @@ class TensorRingEmbedding(nn.Module):
         self.cores.initialize(init_method)
 
         # Precompute strides for mixed-radix decomposition of token IDs
-        self._vocab_strides = self._compute_strides(self.structure.vocab_factor_sizes)
-        self._emb_strides = self._compute_strides(self.structure.emb_factor_sizes)
+        self._vocab_strides = compute_mixed_radix_strides(self.structure.vocab_factor_sizes)
+        self._emb_strides = compute_mixed_radix_strides(self.structure.emb_factor_sizes)
 
         # Eval cache (thread-safe via local caching)
         self._emb_cache: Optional[torch.Tensor] = None
@@ -175,17 +175,7 @@ class TensorRingEmbedding(nn.Module):
             f"params={self.num_parameters:,}"
         )
 
-    @staticmethod
-    def _compute_strides(factors: List[int]) -> List[int]:
-        """Compute strides for mixed-radix decomposition.
-        strides[i] = product of factors[i+1:]"""
-        strides = []
-        for i in range(len(factors)):
-            s = 1
-            for j in range(i + 1, len(factors)):
-                s *= factors[j]
-            strides.append(s)
-        return strides
+    _compute_strides = staticmethod(compute_mixed_radix_strides)
 
     def _decompose_indices(
         self, flat_indices: torch.Tensor, factor_sizes: List[int], strides: List[int]
@@ -726,82 +716,59 @@ class TensorRingEmbedding(nn.Module):
     ) -> float:
         """Enhanced distribution-aware reconstruction error.
 
-        Improved NeurIPS 2025 formulation with:
-        - Adaptive spectral weighting based on eigenvalue decay
-        - Memory-efficient covariance estimation
-        - Robust numerical stability
-        - Statistical significance weighting
-
-        This formulation better captures output distribution shift rather than
-        standard Frobenius norm, leading to better predictions of downstream task degradation.
+        Builds on v1 with adaptive spectral weighting and optional regularization.
+        See :meth:`distribution_aware_reconstruction_error` for base formulation.
 
         Args:
             original_matrix: The original (V, D) embedding matrix.
-            cov_matrix: Precomputed (D, D) covariance matrix ``X^T X`` of input
-                       token embeddings. If None, estimated from input_probs.
-            input_probs: (V,) token frequency distribution. If None, estimated.
-            adaptive_weighting: Use adaptive spectral weighting (default True).
-            spectral_regularization: Apply spectral regularization to prevent
-                                    overfitting to principal components.
+            cov_matrix: Precomputed (D, D) covariance matrix.
+            input_probs: (V,) token frequency distribution.
+            adaptive_weighting: If True and no cov_matrix/probs given, weight by
+                               inverse singular values.
+            spectral_regularization: Add penalty for high-variance components not
+                                    captured by the TR decomposition.
 
         Returns:
-            Enhanced distribution-aware reconstruction error (scalar).
+            Distribution-aware reconstruction error (scalar).
         """
         with torch.no_grad():
             reconstructed = self.reconstruct()
-            diff = original_matrix - reconstructed  # (V, D)
-            diff_norm = torch.norm(diff)
+            diff = original_matrix - reconstructed
             orig_norm = torch.norm(original_matrix)
-
-            # Handle zero matrix edge case
             if orig_norm < 1e-10:
                 return 0.0
 
-            if adaptive_weighting or spectral_regularization:
-                dtype_svd = torch.float32
-                S = torch.linalg.svdvals(original_matrix.to(dtype_svd))
+            base_error = torch.norm(diff) / orig_norm
+
+            if spectral_regularization:
+                S = torch.linalg.svdvals(original_matrix.to(torch.float32))
+                rank = self.rank
+                reg_coeff = min(0.1, 1.0 / max(rank, 1) ** 0.5)
+                n_components = min(5, len(S), rank)
                 total_var = (S ** 2).sum()
+                spectrum_penalty = 0.0
+                for i in range(n_components):
+                    cum_var_before = (S[:i] ** 2).sum() if i > 0 else 0.0
+                    spectrum_penalty += max(0.0, 1.0 - cum_var_before / max(total_var, 1e-10))
+                return (base_error + spectrum_penalty * reg_coeff).item()
 
-                if spectral_regularization:
-                    rank = self.rank
-                    V, D = original_matrix.shape
-                    main_loss = diff_norm / orig_norm
-                    reg_coeff = min(0.1, 1.0 / max(rank, 1) ** 0.5)
-                    n_components = min(5, len(S), rank)
-                    spectrum_loss = torch.tensor(0.0, device=diff.device)
-                    for i in range(n_components):
-                        cum_var_before = (S[:i] ** 2).sum() if i > 0 else torch.tensor(0.0)
-                        spectrum_loss = spectrum_loss + max(0.0, 1.0 - cum_var_before / max(total_var, 1e-10)) * reg_coeff
-                    error = main_loss + spectrum_loss.item()
-                else:
-                    error = diff_norm / orig_norm
-                    if input_probs is not None:
-                        V = original_matrix.shape[0]
-                        probs = input_probs.to(diff.device, diff.dtype)
-                        probs = probs / probs.sum()
-                        sqrt_probs = probs.sqrt()
-                        weighted = diff * sqrt_probs.unsqueeze(1)
-                        error = weighted.norm() / orig_norm
+            if adaptive_weighting and cov_matrix is None and input_probs is None:
+                return base_error.item()
 
-            elif cov_matrix is not None:
-                cov_reg = cov_matrix.to(diff.dtype) + torch.eye(cov_matrix.shape[0],
-                                                               device=cov_matrix.device) * 1e-6
-                weighted = diff @ cov_reg @ diff.T
-                trace = torch.diag(weighted).sum()
-                error = torch.sqrt(trace / max(original_matrix.numel(), 1)).item()
+            if cov_matrix is not None:
+                cov_reg = cov_matrix.to(diff.dtype) + torch.eye(
+                    cov_matrix.shape[0], device=cov_matrix.device
+                ) * 1e-6
+                trace = torch.diag(diff @ cov_reg @ diff.T).sum()
+                return torch.sqrt(trace / max(original_matrix.numel(), 1)).item()
 
-            elif input_probs is not None:
-                V = original_matrix.shape[0]
+            if input_probs is not None:
                 probs = input_probs.to(diff.device, diff.dtype)
                 probs = probs / probs.sum()
-                sqrt_probs = probs.sqrt()
-                weighted = diff * sqrt_probs.unsqueeze(1)
-                error = weighted.norm() / orig_norm
+                weighted = diff * probs.sqrt().unsqueeze(1)
+                return (weighted.norm() / orig_norm).item()
 
-            else:
-                error = self.reconstruction_error(original_matrix)
-
-            return error
+            return self.reconstruction_error(original_matrix)
 
     @classmethod
     def spectral_gap_rank_suggestion(
@@ -979,7 +946,8 @@ class TensorRingEmbedding(nn.Module):
                     rank = (orig_dist[i, orig_knn_indices[i]] < orig_dist[i, neighbor]).sum().item()
                     trustworthiness_sum += max(0, rank - n_neighbors)
 
-            T = 1.0 - (2.0 / (V * n_neighbors * (2 * self.embedding_dim + 1))) * trustworthiness_sum
+            denom = V * n_neighbors * (2 * V - 3 * n_neighbors - 1)
+            T = 1.0 - (2.0 / denom) * trustworthiness_sum if denom > 0 else 1.0
             return max(0.0, min(1.0, T))
 
     def continuity(self, original_matrix: torch.Tensor, n_neighbors: int = 15,
@@ -1021,7 +989,8 @@ class TensorRingEmbedding(nn.Module):
                     rank = (rec_dist[i, rec_knn_indices[i]] < rec_dist[i, neighbor]).sum().item()
                     continuity_sum += max(0, rank - n_neighbors)
 
-            C = 1.0 - (2.0 / (V * n_neighbors * (2 * self.embedding_dim + 1))) * continuity_sum
+            denom = V * n_neighbors * (2 * V - 3 * n_neighbors - 1)
+            C = 1.0 - (2.0 / denom) * continuity_sum if denom > 0 else 1.0
             return max(0.0, min(1.0, C))
 
     def _pairwise_distances(self, matrix: torch.Tensor, metric: str = "euclidean") -> torch.Tensor:
@@ -1055,7 +1024,8 @@ class TensorRingEmbedding(nn.Module):
                 rank = (orig_dist[i, orig_knn[i]] < orig_dist[i, neighbor]).sum().item()
                 t_sum += max(0, rank - n_neighbors)
 
-        T = 1.0 - (2.0 / (n_sample * n_neighbors * (2 * self.embedding_dim + 1))) * t_sum
+        denom = n_sample * n_neighbors * (2 * n_sample - 3 * n_neighbors - 1)
+        T = 1.0 - (2.0 / denom) * t_sum if denom > 0 else 1.0
         return max(0.0, min(1.0, T))
 
     def _continuity_sampled(self, original_matrix: torch.Tensor, reconstructed: torch.Tensor,

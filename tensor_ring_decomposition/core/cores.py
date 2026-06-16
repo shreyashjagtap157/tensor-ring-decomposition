@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .factorization import RingStructure
+from .factorization import RingStructure, compute_mixed_radix_strides
 from ..utils.gauge import GaugeFixer
 
 logger = logging.getLogger(__name__)
@@ -80,6 +80,7 @@ class TensorRingCores(nn.Module):
 
         self._step = 0
         self._init_info: Dict[str, any] = {}
+        self._cached_param_count: Optional[int] = None
 
     def initialize(
         self, init_method: str, embedding_matrix: Optional[torch.Tensor] = None,
@@ -124,6 +125,7 @@ class TensorRingCores(nn.Module):
         else:
             raise ValueError(f"Unknown init_method: {init_method}")
 
+        self._cached_param_count = None
         elapsed = time.monotonic() - t0
         self._init_info = {"method": init_method, "duration_s": elapsed}
         logger.info(f"Init '{init_method}' completed in {elapsed:.2f}s")
@@ -215,12 +217,7 @@ class TensorRingCores(nn.Module):
             input_probs = input_probs / input_probs.sum()
             sqrt_probs = input_probs.sqrt()
 
-        strides = []
-        for i in range(k):
-            s = 1
-            for j in range(i + 1, k):
-                s *= vf[j]
-            strides.append(s)
+        strides = compute_mixed_radix_strides(vf)
 
         def forward_fn(indices: torch.Tensor) -> torch.Tensor:
             flat = indices.reshape(-1)
@@ -457,8 +454,12 @@ class TensorRingCores(nn.Module):
         return norms
 
     def parameter_count(self) -> int:
-        """Total parameters across all cores."""
-        return sum(p.numel() for p in self.parameters())
+        """Total parameters across all cores. Result is cached."""
+        if self._cached_param_count is not None:
+            return self._cached_param_count
+        count = sum(p.numel() for p in self.parameters())
+        self._cached_param_count = count
+        return count
 
     def dense_parameter_count(self) -> int:
         """Equivalent dense parameter count."""

@@ -7,12 +7,30 @@ name = "tensor-ring-decomposition"
 version = "0.3.0"
 description = "Tensor Ring Decomposition for Embedding compression — drop-in replacement for nn.Embedding with 10-100x parameter reduction"
 readme = "README.md"
-license = "MIT"
+license = {text = "MIT"}
 requires-python = ">=3.9"
 dependencies = [
     "torch>=2.0",
     "opt_einsum>=3.3",
     "safetensors>=0.4",
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/shreyashjagtap157/tensor-ring-decomposition"
+Repository = "https://github.com/shreyashjagtap157/tensor-ring-decomposition"
+Documentation = "https://github.com/shreyashjagtap157/tensor-ring-decomposition#readme"
+
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 
 [project.optional-dependencies]

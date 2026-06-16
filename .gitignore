@@ -1,17 +1,24 @@
-# Byte-compiled
+# Tensor Ring Decomposition .gitignore
+
+# Benchmark output files (regeneratable)
+benchmark_quality_*.json
+benchmark_results_analytical.json
+benchmark_report_comprehensive.json
+
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-
-# HuggingFace cache (project-local)
-.hf_cache/
-
-# Build artifacts
+*$py.class
+*.so
+*.egg-info/
 dist/
 build/
-*.egg-info/
-*.egg
+
+# Environment
+.env
+.venv
+venv/
+env/
 
 # IDE
 .vscode/
@@ -23,13 +30,5 @@ build/
 .DS_Store
 Thumbs.db
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
-
-# Logs
-*.log
-
-# Jupyter
-.ipynb_checkpoints/
+# HF cache
+.hf_cache/

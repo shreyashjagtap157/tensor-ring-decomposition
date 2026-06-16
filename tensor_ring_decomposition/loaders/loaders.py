@@ -6,7 +6,6 @@ Supports PyTorch, safetensors, NumPy, GGUF, and HuggingFace Transformers.
 from __future__ import annotations
 
 import logging
-import struct
 from pathlib import Path
 from typing import Dict, Optional, Tuple, Union
 

@@ -7,7 +7,7 @@ from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
-from .core.embedding import TensorRingEmbedding, AutotuneResult, ExportFormat
+from .core.embedding import TensorRingEmbedding
 from .models.registry import ModelProfile, ModelRegistry
 from .loaders.loaders import load_embedding_matrix
 

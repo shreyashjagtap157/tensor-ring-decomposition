@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.3.0 (released)
 
 ### Enterprise Features
 - Distribution-aware training loss (NeurIPS 2025) — `||(W-Ŵ)Σ^{1/2}||_F`

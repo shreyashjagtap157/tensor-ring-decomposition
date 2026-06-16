@@ -435,18 +435,20 @@ class TestQuantization:
 # ── Test 12: Serialization roundtrip with full metadata ─────────
 
 class TestFullSerializationRoundtrip:
+    _tmp_dir: Optional[Path] = None
 
-    def _get_test_path(self, suffix: str = "") -> str:
-        """Get a test path in a writable temp directory."""
+    @staticmethod
+    def _get_test_dir() -> Path:
         import tempfile
-        d = tempfile.mkdtemp(prefix="tr_test_")
-        return str(Path(d) / f"test{suffix}")
+        d = Path(tempfile.mkdtemp(prefix="tr_serial_"))
+        return d
 
     def test_roundtrip_with_full_config(self):
+        d = self._get_test_dir()
+        p = str(d / "test_full")
         emb = TensorRingEmbedding(100, 32, rank=4, max_seq_len=512, padding_idx=0,
                                    gauge_fix="left", gauge_fix_interval=500,
                                    spectral_reg_coeff=1e-4)
-        p = self._get_test_path("_full")
         save(emb, p)
         loaded = load(p)
         assert loaded.vocab_size == 100
@@ -454,24 +456,26 @@ class TestFullSerializationRoundtrip:
         assert loaded.rank == 4
         assert loaded.max_seq_len == 512
         assert loaded.padding_idx == 0
+        import shutil; shutil.rmtree(d, ignore_errors=True)
 
     def test_roundtrip_output_match(self):
+        d = self._get_test_dir()
+        p = str(d / "test_match")
         emb = TensorRingEmbedding(100, 32, rank=4)
         indices = torch.randint(0, 100, (8, 16))
         with torch.no_grad():
             expected = emb(indices)
-
-        p = self._get_test_path("_match")
         save(emb, p)
         loaded = load(p)
         with torch.no_grad():
             actual = loaded(indices)
-
         assert torch.allclose(expected, actual, atol=1e-5), "Output mismatch after load"
+        import shutil; shutil.rmtree(d, ignore_errors=True)
 
     def test_manifest_compression_metrics(self):
+        d = self._get_test_dir()
+        p = str(d / "test_metrics")
         emb = TensorRingEmbedding(100, 32, rank=4)
-        p = self._get_test_path("_metrics")
         save(emb, p)
         import json
         manifest = json.loads(Path(p + ".json").read_text())
@@ -480,12 +484,13 @@ class TestFullSerializationRoundtrip:
         assert "compression_ratio" in metrics
         assert "num_parameters" in metrics
         assert "params_saved" in metrics
+        import shutil; shutil.rmtree(d, ignore_errors=True)
 
     def test_roundtrip_tamper_detection(self):
+        d = self._get_test_dir()
+        p = str(d / "test_tamper")
         emb = TensorRingEmbedding(100, 32, rank=4)
-        p = self._get_test_path("_tamper")
         save(emb, p, secret_key=b"mysecret")
-        # Tamper with the weights
         sf_path = Path(p + ".safetensors")
         data = sf_path.read_bytes()
         corrupted = bytearray(data)
@@ -1158,8 +1163,10 @@ class TestLARSGradientScaling:
 
 class TestDiverseEmbeddings:
     @pytest.mark.parametrize("V,D,R", [
-        (1000, 32, 8), (5000, 64, 16), (10000, 128, 32),
-        (500, 1024, 64), (10000, 256, 32),
+        (1000, 32, 8), (5000, 64, 16),
+        pytest.param(10000, 128, 32, marks=pytest.mark.slow),
+        pytest.param(500, 1024, 64, marks=pytest.mark.slow),
+        pytest.param(10000, 256, 32, marks=pytest.mark.slow),
     ])
     def test_various_shapes_with_als(self, V, D, R):
         matrix = torch.randn(V, D)

@@ -136,6 +136,20 @@ def find_highly_factorable_dim(
     return best_dim, best_factors
 
 
+def compute_mixed_radix_strides(factors: List[int]) -> List[int]:
+    """Compute strides for mixed-radix decomposition.
+
+    strides[i] = product of factors[i+1:]
+    """
+    strides = []
+    for i in range(len(factors)):
+        s = 1
+        for j in range(i + 1, len(factors)):
+            s *= factors[j]
+        strides.append(s)
+    return strides
+
+
 @dataclass
 class RingStructure:
     """Complete specification of a tensor ring decomposition."""
