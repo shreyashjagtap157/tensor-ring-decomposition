@@ -29,7 +29,7 @@ class TestValidateIndices:
         )
 
     def test_very_negative_with_padding(self):
-        with pytest.raises(IndexError, match="negative"):
+        with pytest.raises(IndexError, match="less than -1|padding marker"):
             validate_indices(
                 torch.tensor([-2, 0, 1]), vocab_size=10, padding_idx=0
             )

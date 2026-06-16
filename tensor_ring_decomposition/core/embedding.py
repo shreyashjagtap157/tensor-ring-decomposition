@@ -96,7 +96,7 @@ class TensorRingEmbedding(nn.Module):
         target_compression: Optional[float] = None,
         target_params: Optional[int] = None,
         split_mode: Literal["balanced", "proportional", "manual"] = "balanced",
-        init_method: Literal["uniform", "normal", "kaiming", "svd", "tr_svd", "distribution_aware"] = "uniform",
+        init_method: Literal["uniform", "normal", "kaiming", "svd", "tr_svd", "als", "distribution_aware"] = "uniform",
         gauge_fix: Literal["none", "left", "right", "both"] = "left",
         gauge_fix_interval: int = 1000,
         padding_idx: Optional[int] = None,
@@ -750,64 +750,55 @@ class TensorRingEmbedding(nn.Module):
         with torch.no_grad():
             reconstructed = self.reconstruct()
             diff = original_matrix - reconstructed  # (V, D)
+            diff_norm = torch.norm(diff)
+            orig_norm = torch.norm(original_matrix)
 
-            # Compute singular value spectrum of the embedding matrix
+            # Handle zero matrix edge case
+            if orig_norm < 1e-10:
+                return 0.0
+
             if adaptive_weighting or spectral_regularization:
-                U, S, Vt = torch.linalg.svd(original_matrix.to(torch.float32), full_matrices=False)
+                dtype_svd = torch.float32
+                S = torch.linalg.svdvals(original_matrix.to(dtype_svd))
                 total_var = (S ** 2).sum()
-                
+
                 if spectral_regularization:
-                    # Spectral regularization coefficient based on rank
                     rank = self.rank
-                    reg_coeff = min(0.1, 1.0 / (rank ** 0.5))
-                    
-                    # Penalize poor reconstruction of principal components
-                    spectrum_loss = torch.tensor(0.0, device=original_matrix.device)
-                    for i in range(min(5, len(S))):  # Focus on top 5 components
-                        component_var = S[i] ** 2
-                        target_var = total_var * (0.1 ** (i / 5))
-                        spectrum_loss += torch.abs(component_var - target_var) * reg_coeff
-                    
-                    # Combine with main loss
-                    main_loss = torch.norm(diff)
-                    error = (main_loss + spectrum_loss) / (1 + spectrum_loss.item())
+                    V, D = original_matrix.shape
+                    main_loss = diff_norm / orig_norm
+                    reg_coeff = min(0.1, 1.0 / max(rank, 1) ** 0.5)
+                    n_components = min(5, len(S), rank)
+                    spectrum_loss = torch.tensor(0.0, device=diff.device)
+                    for i in range(n_components):
+                        cum_var_before = (S[:i] ** 2).sum() if i > 0 else torch.tensor(0.0)
+                        spectrum_loss = spectrum_loss + max(0.0, 1.0 - cum_var_before / max(total_var, 1e-10)) * reg_coeff
+                    error = main_loss + spectrum_loss.item()
                 else:
-                    # Use standard Frobenius norm with adaptive weighting
+                    error = diff_norm / orig_norm
                     if input_probs is not None:
-                        # Adaptive weighting based on singular value spectrum
-                        S_avg = S.mean()
-                        adaptive_weights = (S / S_avg).sqrt() * input_probs.sqrt().unsqueeze(0)
-                        
-                        # Apply to the embedding matrix differences
-                        weighted_diff = diff * adaptive_weights.unsqueeze(0)
-                        error = torch.sqrt(torch.diag(weighted_diff @ weighted_diff.T).sum() / original_matrix.numel())
-                    else:
-                        error = torch.norm(diff) / original_matrix.norm()
+                        V = original_matrix.shape[0]
+                        probs = input_probs.to(diff.device, diff.dtype)
+                        probs = probs / probs.sum()
+                        sqrt_probs = probs.sqrt()
+                        weighted = diff * sqrt_probs.unsqueeze(1)
+                        error = weighted.norm() / orig_norm
 
             elif cov_matrix is not None:
-                # Use provided covariance matrix
-                cov_reg = cov_matrix.to(diff.dtype) + torch.eye(cov_matrix.shape[0], 
+                cov_reg = cov_matrix.to(diff.dtype) + torch.eye(cov_matrix.shape[0],
                                                                device=cov_matrix.device) * 1e-6
                 weighted = diff @ cov_reg @ diff.T
-                error = torch.sqrt(torch.diag(weighted).sum() / original_matrix.numel()).item()
+                trace = torch.diag(weighted).sum()
+                error = torch.sqrt(trace / max(original_matrix.numel(), 1)).item()
 
             elif input_probs is not None:
-                # Use input probabilities for weighting
-                if input_probs.dim() == 1:
-                    # Token-level weighting
-                    probs = input_probs.to(diff.device, diff.dtype)
-                    weighted_diff = diff.T * probs.unsqueeze(0)  # (D, V)
-                    weighted_diff = weighted_diff @ diff
-                    error = torch.sqrt(torch.diag(weighted_diff).sum() / original_matrix.numel()).item()
-                else:
-                    # Sample-level weighting
-                    weights = input_probs.to(diff.device, diff.dtype) ** 0.75
-                    weighted_diff = diff.T * weights.unsqueeze(0)
-                    weighted_diff = weighted_diff @ diff
-                    error = torch.sqrt(torch.diag(weighted_diff).sum() / original_matrix.numel()).item()
+                V = original_matrix.shape[0]
+                probs = input_probs.to(diff.device, diff.dtype)
+                probs = probs / probs.sum()
+                sqrt_probs = probs.sqrt()
+                weighted = diff * sqrt_probs.unsqueeze(1)
+                error = weighted.norm() / orig_norm
 
             else:
-                # Fall back to standard Frobenius norm
                 error = self.reconstruction_error(original_matrix)
 
             return error
@@ -1644,7 +1635,7 @@ class ZipfHybridTensorRingEmbedding(nn.Module):
         target_compression: Optional[float] = None,
         target_params: Optional[int] = None,
         split_mode: Literal["balanced", "proportional", "manual"] = "balanced",
-        init_method: Literal["uniform", "normal", "kaiming", "svd", "tr_svd", "distribution_aware"] = "uniform",
+        init_method: Literal["uniform", "normal", "kaiming", "svd", "tr_svd", "als", "distribution_aware"] = "uniform",
         gauge_fix: Literal["none", "left", "right", "both"] = "left",
         gauge_fix_interval: int = 1000,
         padding_idx: Optional[int] = None,

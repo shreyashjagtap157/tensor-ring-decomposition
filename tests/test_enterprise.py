@@ -906,13 +906,13 @@ class TestSuggestRank:
 
 class TestFromHuggingFace:
     @pytest.mark.slow
-    @pytest.mark.skipif(True, reason="Requires transformers — only run manually")
+    @pytest.mark.skipif("torch.cuda.is_available() == False", reason="Requires HF model download — slow")
     def test_from_huggingface_with_auto_rank(self):
         emb = TensorRingEmbedding.from_huggingface("bert-base-uncased")
         assert emb.rank == 8  # default rank for BERT base
 
     @pytest.mark.slow
-    @pytest.mark.skipif(True, reason="Requires transformers — only run manually")
+    @pytest.mark.skipif("torch.cuda.is_available() == False", reason="Requires HF model download — slow")
     def test_from_huggingface_with_target(self):
         emb = TensorRingEmbedding.from_huggingface("bert-base-uncased", target_compression=100)
         assert emb.compression_ratio >= 50.0

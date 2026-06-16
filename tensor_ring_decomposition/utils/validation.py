@@ -23,7 +23,13 @@ def validate_indices(
     if indices.numel() == 0:
         return
     if indices.min() < 0:
-        if padding_idx is None or indices.min() < -1:
+        if padding_idx is not None:
+            if indices.min() < -1:
+                raise IndexError(
+                    f"Indices contain values < -1 (min={indices.min().item()}). "
+                    f"Only -1 is allowed as a padding marker when padding_idx is set."
+                )
+        else:
             raise IndexError(
                 f"Indices contain negative values (min={indices.min().item()}). "
                 f"Set padding_idx if negative indices are intentional."
