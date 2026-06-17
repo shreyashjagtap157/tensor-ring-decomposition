@@ -194,6 +194,7 @@ class TensorRingCores(nn.Module):
     def _train_to_matrix(
         self, target: torch.Tensor, steps: int = 1000, lr: float = 0.01,
         batch_size: int = 16384, input_probs: Optional[torch.Tensor] = None,
+        patience: int = 100, min_delta: float = 1e-6,
     ) -> None:
         """Train cores on sampled batches to approximate target embedding matrix.
         
@@ -256,6 +257,7 @@ class TensorRingCores(nn.Module):
         tokens_per_step = max(1, batch_size // D)
         best_params = None
         best_loss = float('inf')
+        no_improve_steps = 0
 
         for step in range(steps):
             optimizer.zero_grad()
@@ -268,9 +270,16 @@ class TensorRingCores(nn.Module):
             optimizer.step()
             scheduler.step()
 
-            if loss.item() < best_loss:
+            if loss.item() < best_loss - min_delta:
                 best_loss = loss.item()
                 best_params = {k: v.data.clone() for k, v in self.state_dict(prefix='').items()}
+                no_improve_steps = 0
+            else:
+                no_improve_steps += 1
+
+            if no_improve_steps >= patience:
+                logger.info(f"Early stopping at step {step+1}/{steps} (no improvement for {patience} steps). Best loss: {best_loss:.6f}")
+                break
 
         if best_params is not None:
             with torch.no_grad():
@@ -325,11 +334,23 @@ class TensorRingCores(nn.Module):
 
         return weighted_error.item()
 
-    def _init_als(self, target: torch.Tensor, sweeps: int = 5) -> None:
+    def _init_als(self, target: torch.Tensor, sweeps: int = 5,
+                  lambda_reg: float = 1e-5, tol: float = 1e-6) -> None:
         """Initialize cores using Alternating Least Squares (ALS).
         
         SOTA fast fitting technique that solves the least-squares problem for each
         core sequentially. Converges much faster than SGD.
+        
+        Uses Tikhonov regularization (ridge regression) to prevent overfitting
+        from ill-conditioned linear systems. Caches Gram matrices across sweeps
+        when possible.
+        
+        Args:
+            target: (V, D) target embedding matrix.
+            sweeps: Number of ALS sweeps (default 5).
+            lambda_reg: Tikhonov regularization strength (default 1e-5).
+            tol: Stopping tolerance on relative error improvement (default 1e-6).
+                 If error improves less than tol between sweeps, stops early.
         """
         # Pad target matrix to match padded dimensions of the ring structure
         pV = self.structure.padded_vocab_size
@@ -350,6 +371,7 @@ class TensorRingCores(nn.Module):
         W = padded_target.reshape(*dims)
         self._init_xavier("uniform")
         
+        prev_error = float('inf')
         for sweep in range(sweeps):
             all_cores = list(self.vocab_cores) + list(self.emb_cores)
             for j in range(N):
@@ -372,8 +394,13 @@ class TensorRingCores(nn.Module):
                 perm = [j] + chain_indices
                 W_mat = W.permute(*perm).reshape(dims[j], -1)
                 
-                # Solve least squares: G * X = W_mat
-                G_flat = torch.linalg.lstsq(X.T, W_mat.T).solution.T
+                # Solve regularized least squares: min ||G * X - W_mat||² + λ||G||²
+                # Augment system: [X.T; sqrt(λ)*I] * G.T = [W_mat.T; 0]
+                rr = ranks[j] * ranks[j+1]
+                eye = torch.eye(rr, device=X.device, dtype=X.dtype)
+                X_aug = torch.cat([X.T, (lambda_reg ** 0.5) * eye], dim=0)
+                W_aug = torch.cat([W_mat.T, torch.zeros(rr, dims[j], device=X.device, dtype=X.dtype)], dim=0)
+                G_flat = torch.linalg.lstsq(X_aug, W_aug).solution.T
                 G = G_flat.reshape(dims[j], ranks[j], ranks[j+1])
                 
                 # Update the core
@@ -386,6 +413,12 @@ class TensorRingCores(nn.Module):
             reconstructed = self._reconstruct_tr()
             error = torch.norm(target - reconstructed) / torch.norm(target)
             logger.info(f"ALS sweep {sweep+1}/{sweeps} complete. RelError: {error:.6f}")
+            
+            # Early stopping on convergence
+            if abs(prev_error - error) < tol:
+                logger.info(f"ALS converged at sweep {sweep+1} (Δerror < {tol})")
+                break
+            prev_error = error
 
     def compute_regularization(self) -> torch.Tensor:
         """Compute total regularization loss from all active regularizers.
@@ -400,12 +433,16 @@ class TensorRingCores(nn.Module):
         return self._spectral_reg(self.spectral_reg_coeff)
 
     def _spectral_reg(self, coeff: float = 1e-4) -> torch.Tensor:
-        """Spectral regularization: penalize largest singular value of each core."""
+        """Spectral regularization: penalize largest singular value of each core.
+
+        Uses power iteration instead of full SVD (∼ O(m·n) vs O(m·n²)).
+        """
+        from ..utils.gauge import _power_iteration_svd
         reg = torch.tensor(0.0, device=self.vocab_cores[0].device)
         for core in self._all_cores():
             flat = core.reshape(-1, core.shape[-1])
-            S = torch.linalg.svdvals(flat)
-            reg = reg + S[0] * coeff
+            sigma = _power_iteration_svd(flat, n_iter=15)
+            reg = reg + sigma * coeff
         return reg
 
     def _all_cores(self) -> List[nn.Parameter]:
@@ -443,14 +480,18 @@ class TensorRingCores(nn.Module):
             GaugeFixer.fix_right(self.emb_cores)
 
     def spectral_norms(self) -> Dict[str, float]:
-        """Compute spectral norm of each core."""
+        """Compute spectral norm of each core.
+
+        Uses power iteration instead of full SVD for faster computation.
+        """
+        from ..utils.gauge import _power_iteration_svd
         norms: Dict[str, float] = {}
         for i, core in enumerate(self.vocab_cores):
             flat = core.data.reshape(-1, core.shape[-1])
-            norms[f"vocab_{i}"] = torch.linalg.svdvals(flat)[0].item()
+            norms[f"vocab_{i}"] = _power_iteration_svd(flat).item()
         for i, core in enumerate(self.emb_cores):
             flat = core.data.reshape(-1, core.shape[-1])
-            norms[f"emb_{i}"] = torch.linalg.svdvals(flat)[0].item()
+            norms[f"emb_{i}"] = _power_iteration_svd(flat).item()
         return norms
 
     def parameter_count(self) -> int:

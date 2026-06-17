@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import enum
 import json
 import logging
@@ -109,23 +110,24 @@ class ModelRegistry:
 
     @classmethod
     def get(cls, name: str) -> Optional[ModelProfile]:
-        return cls._profiles.get(name.lower())
+        profile = cls._profiles.get(name.lower())
+        return copy.deepcopy(profile) if profile is not None else None
 
     @classmethod
     def lookup(cls, vocab_size: int, embedding_dim: int) -> List[ModelProfile]:
         matches = []
         for profile in cls._profiles.values():
             if profile.vocab_size == vocab_size and profile.embedding_dim == embedding_dim:
-                matches.append(profile)
+                matches.append(copy.deepcopy(profile))
         return matches
 
     @classmethod
     def list_by_family(cls, family: ModelFamily) -> List[ModelProfile]:
-        return [p for p in cls._profiles.values() if p.family == family]
+        return [copy.deepcopy(p) for p in cls._profiles.values() if p.family == family]
 
     @classmethod
     def list_all(cls) -> List[ModelProfile]:
-        return list(cls._profiles.values())
+        return [copy.deepcopy(p) for p in cls._profiles.values()]
 
     @classmethod
     def summary(cls) -> str:

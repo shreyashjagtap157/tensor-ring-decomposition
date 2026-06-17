@@ -88,11 +88,15 @@ class NonNegativeClamp(Function):
     """Clamp gradients while clamping values to non-negative."""
     @staticmethod
     def forward(ctx, x):
+        ctx.save_for_backward(x)
         return x.clamp(min=0)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output.clone()
+        x, = ctx.saved_tensors
+        grad = grad_output.clone()
+        grad = grad.masked_fill(x < 0, 0.0)
+        return grad
 
 
 class QuantizedTensorRingEmbedding(nn.Module):
