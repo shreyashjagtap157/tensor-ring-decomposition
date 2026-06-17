@@ -65,6 +65,8 @@ def load_from_torch(
                 return raw[ak]
 
         tensor_keys = {k: v for k, v in raw.items() if isinstance(v, torch.Tensor) and v.ndim == 2}
+        if not tensor_keys:
+            raise ValueError(f"No 2D tensor found. Available keys: {list(raw.keys())[:10]}")
         largest = max(tensor_keys, key=lambda k: tensor_keys[k].shape[0] * tensor_keys[k].shape[1])
         logger.warning(f"No standard key found. Using largest 2D tensor: '{largest}' "
                        f"shape={tuple(tensor_keys[largest].shape)}")
@@ -109,7 +111,7 @@ def load_from_safetensors(
 
     tensor_keys = {k: v for k, v in tensors.items() if isinstance(v, torch.Tensor) and v.ndim == 2}
     if not tensor_keys:
-        raise KeyError(f"No 2D tensor found in safetensors file. Keys: {list(tensors.keys())[:10]}")
+        raise ValueError(f"No 2D tensor found in safetensors file. Keys: {list(tensors.keys())[:10]}")
     largest = max(tensor_keys, key=lambda k: tensor_keys[k].shape[0] * tensor_keys[k].shape[1])
     logger.warning(f"No standard key found. Using largest 2D tensor: '{largest}' "
                    f"shape={tuple(tensor_keys[largest].shape)}")
@@ -241,12 +243,18 @@ def load_from_transformers(
 
 
 def _resolve_key(state_dict: Dict[str, torch.Tensor], key: str) -> torch.Tensor:
-    if key not in state_dict:
-        close_matches = [k for k in state_dict if key in k]
-        if close_matches:
-            return state_dict[close_matches[0]]
-        raise KeyError(f"Key '{key}' not found. Available keys: {list(state_dict.keys())[:20]}")
-    return state_dict[key]
+    if key in state_dict:
+        return state_dict[key]
+    # Try suffix match: "embed_tokens.weight" matches "...embed_tokens.weight"
+    suffix_matches = [k for k in state_dict if k.endswith(key)]
+    if suffix_matches:
+        return state_dict[suffix_matches[0]]
+    # Fallback to substring match (log warning)
+    close_matches = [k for k in state_dict if key in k and isinstance(state_dict[k], torch.Tensor)]
+    if close_matches:
+        logger.warning(f"No exact/suffix match for '{key}'. Using substring match: '{close_matches[0]}'")
+        return state_dict[close_matches[0]]
+    raise KeyError(f"Key '{key}' not found. Available keys: {list(state_dict.keys())[:20]}")
 
 
 def load_embedding_matrix(

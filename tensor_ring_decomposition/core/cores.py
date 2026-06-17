@@ -101,7 +101,8 @@ class TensorRingCores(nn.Module):
         if init_method == "svd":
             if embedding_matrix is None:
                 raise ValueError("SVD init requires embedding_matrix")
-            self._init_svd(embedding_matrix)
+            steps = kwargs.get("steps", 1000)
+            self._init_svd(embedding_matrix, steps=steps)
         elif init_method == "tr_svd":
             if embedding_matrix is None:
                 raise ValueError("TR-SVD init requires embedding_matrix")
@@ -178,7 +179,40 @@ class TensorRingCores(nn.Module):
         # Crop to original dimensions to handle padding
         return result[:self.structure.original_vocab_size, :self.structure.original_embedding_dim]
 
-    def _init_svd(self, matrix: torch.Tensor) -> None:
+    def _sample_reconstruct(self, indices: torch.Tensor) -> torch.Tensor:
+        """Reconstruct TR output for specific row indices only.
+
+        Avoids materializing the full V×D matrix. Useful for sampled
+        error computation during ALS sweeps.
+        """
+        from .contraction import compute_emb_precontraction, ring_closure
+        from .factorization import compute_mixed_radix_strides
+
+        k = self.structure.n_vocab_cores
+        vf = self.structure.vocab_factor_sizes
+        strides = compute_mixed_radix_strides(vf)
+
+        flat = indices.reshape(-1)
+        factor_indices: List[torch.Tensor] = []
+        remaining = flat
+        for i in range(k):
+            if i < k - 1:
+                fi = remaining // strides[i]
+                remaining = remaining % strides[i]
+            else:
+                fi = remaining
+            factor_indices.append(fi.clamp(0, vf[i] - 1))
+
+        gathered = [core[factor_indices[i]] for i, core in enumerate(self.vocab_cores)]
+        result = gathered[0]
+        for cg in gathered[1:]:
+            result = torch.bmm(result, cg)
+
+        emb = compute_emb_precontraction(list(self.emb_cores))
+        output = ring_closure(result, emb)
+        return output[..., :self.structure.original_embedding_dim].reshape(-1, self.structure.original_embedding_dim)
+
+    def _init_svd(self, matrix: torch.Tensor, steps: int = 1000) -> None:
         """Initialize via sampled batch training to approximate target matrix.
 
         Uses Xavier init followed by AdamW training on random token batches.
@@ -188,7 +222,7 @@ class TensorRingCores(nn.Module):
         """
         self._init_xavier("uniform")
         logger.info("Starting sampled batch training for from_pretrained init...")
-        self._train_to_matrix(matrix, steps=1000, lr=0.01, batch_size=16384)
+        self._train_to_matrix(matrix, steps=steps, lr=0.01, batch_size=16384)
         logger.info("from_pretrained init complete.")
 
     def _train_to_matrix(
@@ -352,7 +386,9 @@ class TensorRingCores(nn.Module):
             tol: Stopping tolerance on relative error improvement (default 1e-6).
                  If error improves less than tol between sweeps, stops early.
         """
-        # Pad target matrix to match padded dimensions of the ring structure
+        # Pad target matrix to match padded dimensions of the ring structure.
+        # Padded entries are set to zero; the sampled error computation
+        # (using original target indices) naturally ignores padding artifacts.
         pV = self.structure.padded_vocab_size
         pD = self.structure.padded_embedding_dim
         V, D = target.shape
@@ -395,12 +431,13 @@ class TensorRingCores(nn.Module):
                 W_mat = W.permute(*perm).reshape(dims[j], -1)
                 
                 # Solve regularized least squares: min ||G * X - W_mat||² + λ||G||²
-                # Augment system: [X.T; sqrt(λ)*I] * G.T = [W_mat.T; 0]
+                # Normal equations: (X @ X.T + λI) @ G.T = X @ W_mat.T
+                # Uses O(r⁴ + r²·dims[j]) instead of O(D_other·r² + r⁴) memory.
                 rr = ranks[j] * ranks[j+1]
-                eye = torch.eye(rr, device=X.device, dtype=X.dtype)
-                X_aug = torch.cat([X.T, (lambda_reg ** 0.5) * eye], dim=0)
-                W_aug = torch.cat([W_mat.T, torch.zeros(rr, dims[j], device=X.device, dtype=X.dtype)], dim=0)
-                G_flat = torch.linalg.lstsq(X_aug, W_aug).solution.T
+                Gram = X @ X.T
+                if lambda_reg > 0:
+                    Gram = Gram + lambda_reg * torch.eye(rr, device=X.device, dtype=X.dtype)
+                G_flat = torch.linalg.solve(Gram, X @ W_mat.T).T
                 G = G_flat.reshape(dims[j], ranks[j], ranks[j+1])
                 
                 # Update the core
@@ -409,9 +446,13 @@ class TensorRingCores(nn.Module):
                 else:
                     self.emb_cores[j - len(self.vocab_cores)].data.copy_(G)
             
-            # Compute error for the sweep
-            reconstructed = self._reconstruct_tr()
-            error = torch.norm(target - reconstructed) / torch.norm(target)
+            # Compute sampled error for the sweep (avoids full reconstruction)
+            n_sample = min(V, 1024)
+            sample_idx = torch.randperm(V)[:n_sample]
+            with torch.no_grad():
+                target_sample = target[sample_idx]
+                recon_sample = self._sample_reconstruct(sample_idx)
+                error = torch.norm(target_sample - recon_sample) / torch.norm(target_sample)
             logger.info(f"ALS sweep {sweep+1}/{sweeps} complete. RelError: {error:.6f}")
             
             # Early stopping on convergence

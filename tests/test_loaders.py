@@ -306,7 +306,7 @@ class TestLoadFromSafetensors:
         path = os.path.join(tmp_dir, "model.safetensors")
         tensors = {"a": torch.randn(64), "b": torch.randn(4, 4, 4)}
         self._save_sf(tensors, path)
-        with pytest.raises(KeyError, match="No 2D tensor"):
+        with pytest.raises(ValueError, match="No 2D tensor"):
             load_from_safetensors(path)
 
     def test_missing_key_raises(self, tmp_dir):

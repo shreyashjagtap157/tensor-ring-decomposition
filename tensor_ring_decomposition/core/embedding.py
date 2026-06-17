@@ -398,16 +398,18 @@ class TensorRingEmbedding(nn.Module):
             else:
                 hi = mid - 1
 
-        # Optional refinement with training
+        # Optional refinement with training (reuses one embedding, resets rank)
         if training_steps > 0:
             candidates = [max(2, best_rank - 4), best_rank, best_rank + 4]
             best_error = float("inf")
+            ref_emb = cls(V, D, rank=max(2, best_rank - 4), ring_components=ring_components, device=device)
             for r in candidates:
                 if param_fn(r) > dense * 1.1:
                     continue
-                emb = cls(V, D, rank=r, ring_components=ring_components, device=device)
-                emb.cores.initialize("svd", embedding_matrix)
-                error = emb.reconstruction_error(embedding_matrix)
+                if r != ref_emb.rank:
+                    ref_emb = cls(V, D, rank=r, ring_components=ring_components, device=device)
+                ref_emb.cores.initialize("svd", embedding_matrix, steps=training_steps)
+                error = ref_emb.reconstruction_error(embedding_matrix)
                 if verbose:
                     logger.info(f"  Rank {r}: params={param_fn(r):,}, MSE={error:.4f}")
                 if error < best_error:
@@ -669,6 +671,8 @@ class TensorRingEmbedding(nn.Module):
             reconstructed = self.reconstruct()
             error = torch.norm(original_matrix - reconstructed)
             baseline = torch.norm(original_matrix)
+            if baseline < 1e-10:
+                return 0.0
             return (error / baseline).item()
 
     def distribution_aware_reconstruction_error(self, original_matrix: torch.Tensor,
@@ -694,14 +698,15 @@ class TensorRingEmbedding(nn.Module):
             diff = original_matrix - reconstructed  # (V, D)
 
             if cov_matrix is not None:
-                weighted = diff @ cov_matrix.to(diff.dtype) @ diff.T
-                return torch.sqrt(torch.diag(weighted).sum() / original_matrix.numel()).item()
+                # Compute trace(diff @ cov @ diff.T) without O(V²) intermediate
+                weighted_diff = diff @ cov_matrix.to(diff.dtype)
+                trace = (weighted_diff * diff).sum()
+                return torch.sqrt(trace / original_matrix.numel()).item()
 
             if input_probs is not None:
                 probs = input_probs.to(diff.device, diff.dtype)
-                weighted = diff.T * probs.unsqueeze(0)  # (D, V)
-                weighted = weighted @ diff
-                return torch.sqrt(torch.diag(weighted).sum() / original_matrix.numel()).item()
+                trace = (diff * probs.unsqueeze(1) * diff).sum()
+                return torch.sqrt(trace / original_matrix.numel()).item()
 
             # Fall back to standard Frobenius norm
             return self.reconstruction_error(original_matrix)
@@ -745,11 +750,11 @@ class TensorRingEmbedding(nn.Module):
                 rank = self.rank
                 reg_coeff = min(0.1, 1.0 / max(rank, 1) ** 0.5)
                 n_components = min(5, len(S), rank)
-                total_var = (S ** 2).sum()
-                spectrum_penalty = 0.0
-                for i in range(n_components):
-                    cum_var_before = (S[:i] ** 2).sum() if i > 0 else 0.0
-                    spectrum_penalty += max(0.0, 1.0 - cum_var_before / max(total_var, 1e-10))
+                total_var = (S ** 2).sum() + 1e-10
+                cum_var_before = torch.zeros(n_components, device=S.device)
+                if n_components > 1:
+                    cum_var_before[1:] = (S[:n_components-1] ** 2).cumsum(dim=0)
+                spectrum_penalty = (1.0 - cum_var_before / total_var).clamp(min=0.0).sum()
                 return (base_error + spectrum_penalty * reg_coeff).item()
 
             if adaptive_weighting and cov_matrix is None and input_probs is None:
@@ -759,7 +764,8 @@ class TensorRingEmbedding(nn.Module):
                 cov_reg = cov_matrix.to(diff.dtype) + torch.eye(
                     cov_matrix.shape[0], device=cov_matrix.device
                 ) * 1e-6
-                trace = torch.diag(diff @ cov_reg @ diff.T).sum()
+                weighted_diff = diff @ cov_reg
+                trace = (weighted_diff * diff).sum()
                 return torch.sqrt(trace / max(original_matrix.numel(), 1)).item()
 
             if input_probs is not None:
@@ -884,6 +890,9 @@ class TensorRingEmbedding(nn.Module):
         Measures how well the TR approximation preserves the top-k principal
         components. Higher is better (1.0 = perfect preservation).
 
+        Uses randomized SVD (``torch.svd_lowrank``) for efficiency on large matrices.
+        For k ≤ min(V, D)/2, this is significantly faster than full SVD.
+
         Args:
             original_matrix: Original (V, D) embedding matrix.
             k: Number of top components to compare.
@@ -893,8 +902,9 @@ class TensorRingEmbedding(nn.Module):
         """
         with torch.no_grad():
             reconstructed = self.reconstruct()
-            _, S_orig, V_orig = torch.linalg.svd(original_matrix.to(torch.float32), full_matrices=False)
-            _, S_rec, V_rec = torch.linalg.svd(reconstructed.to(torch.float32), full_matrices=False)
+            q = min(k + 5, min(original_matrix.shape[0], original_matrix.shape[1]))
+            U_orig, S_orig, V_orig = torch.svd_lowrank(original_matrix.to(torch.float32), q=q)
+            U_rec, S_rec, V_rec = torch.svd_lowrank(reconstructed.to(torch.float32), q=q)
 
             k = min(k, S_orig.shape[0], S_rec.shape[0])
             if k <= 0:
@@ -1052,7 +1062,8 @@ class TensorRingEmbedding(nn.Module):
                 rank = (rec_dist[i, rec_knn[i]] < rec_dist[i, neighbor]).sum().item()
                 c_sum += max(0, rank - n_neighbors)
 
-        C = 1.0 - (2.0 / (n_sample * n_neighbors * (2 * self.embedding_dim + 1))) * c_sum
+        denom = n_sample * n_neighbors * (2 * n_sample - 3 * n_neighbors - 1)
+        C = 1.0 - (2.0 / denom) * c_sum if denom > 0 else 1.0
         return max(0.0, min(1.0, C))
 
     def get_layerwise_lr_params(self, base_lr: float, decay_factor: float = 0.9) -> List[Dict]:
