@@ -166,7 +166,7 @@ class QuantizedTensorRingEmbedding(nn.Module):
             else:
                 absmax = core.data.abs().max()
                 init_scale = (absmax / 127.0).clamp(min=1e-8)
-                param = nn.Parameter(torch.tensor(init_scale, device=core.device))
+                param = nn.Parameter(init_scale.detach().clone())
             self._vocab_lsq_scales.append(param)
 
         for core in embedding.cores.emb_cores:
@@ -177,7 +177,7 @@ class QuantizedTensorRingEmbedding(nn.Module):
             else:
                 absmax = core.data.abs().max()
                 init_scale = (absmax / 127.0).clamp(min=1e-8)
-                param = nn.Parameter(torch.tensor(init_scale, device=core.device))
+                param = nn.Parameter(init_scale.detach().clone())
             self._emb_lsq_scales.append(param)
 
         self._lsq_initialized = True

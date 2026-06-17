@@ -584,7 +584,7 @@ class TensorRingEmbedding(nn.Module):
         output = ring_closure(vocab_result, emb_contraction)
 
         # Slice to original embedding_dim if padded
-        if output.shape[-1] != self.embedding_dim:
+        if not torch.jit.is_tracing() and output.shape[-1] != self.embedding_dim:
             output = output[..., :self.embedding_dim]
 
         return output.view(*original_shape, self.embedding_dim)

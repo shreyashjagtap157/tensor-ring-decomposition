@@ -64,6 +64,13 @@ python_functions = "test_*"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
 ]
+filterwarnings = [
+    # PyTorch internal deprecations (Python 3.14+): not our code to fix
+    "ignore::DeprecationWarning:torch.jit",
+    "ignore::DeprecationWarning:torch.jit._trace",
+    "ignore::DeprecationWarning:torch.jit._serialization",
+    "ignore::DeprecationWarning:torch.jit._script",
+]
 
 [tool.setuptools.package-data]
 "tensor_ring_decomposition" = ["py.typed"]
