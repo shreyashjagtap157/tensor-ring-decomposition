@@ -107,6 +107,7 @@ class TensorRingEmbedding(nn.Module):
         validate_indices: bool = True,
         auto_pad: bool = True,
         max_padding_pct: float = 0.15,
+        _skip_init: bool = False,
     ):
         super().__init__()
 
@@ -156,11 +157,11 @@ class TensorRingEmbedding(nn.Module):
             dtype, device, spectral_reg_coeff=spectral_reg_coeff,
         )
 
-        self.cores.initialize(init_method)
+        if not _skip_init:
+            self.cores.initialize(init_method)
 
         # Precompute strides for mixed-radix decomposition of token IDs
         self._vocab_strides = compute_mixed_radix_strides(self.structure.vocab_factor_sizes)
-        self._emb_strides = compute_mixed_radix_strides(self.structure.emb_factor_sizes)
 
         # Eval cache (thread-safe via local caching)
         self._emb_cache: Optional[torch.Tensor] = None
@@ -497,7 +498,12 @@ class TensorRingEmbedding(nn.Module):
             Recommended rank based on knee-point detection.
         """
         with torch.no_grad():
-            _, S, _ = torch.linalg.svd(matrix.to(torch.float32), full_matrices=False)
+            matrix_f32 = matrix.to(torch.float32)
+            Vm, Dm = matrix_f32.shape
+            if min(Vm, Dm) > 200:
+                _, S, _ = torch.svd_lowrank(matrix_f32, q=min(min(Vm, Dm), 200))
+            else:
+                _, S, _ = torch.linalg.svd(matrix_f32, full_matrices=False)
             
         total_var = (S ** 2).sum()
         cum_var = torch.cumsum(S ** 2, dim=0) / total_var
@@ -750,8 +756,9 @@ class TensorRingEmbedding(nn.Module):
             original_matrix: The original (V, D) embedding matrix.
             cov_matrix: Precomputed (D, D) covariance matrix.
             input_probs: (V,) token frequency distribution.
-            adaptive_weighting: If True and no cov_matrix/probs given, weight by
-                               inverse singular values.
+            adaptive_weighting: If True and no cov_matrix/probs given, falls back
+                               to standard reconstruction error (inverse-singular-value
+                               weighting not yet implemented).
             spectral_regularization: Add penalty for high-variance components not
                                     captured by the TR decomposition.
 
@@ -768,7 +775,12 @@ class TensorRingEmbedding(nn.Module):
             base_error = torch.norm(diff) / orig_norm
 
             if spectral_regularization:
-                S = torch.linalg.svdvals(original_matrix.to(torch.float32))
+                matrix_f32 = original_matrix.to(torch.float32)
+                Vm, Dm = matrix_f32.shape
+                if min(Vm, Dm) > 200:
+                    _, S, _ = torch.svd_lowrank(matrix_f32, q=min(min(Vm, Dm), 10))
+                else:
+                    S = torch.linalg.svdvals(matrix_f32)
                 rank = self.rank
                 reg_coeff = min(0.1, 1.0 / max(rank, 1) ** 0.5)
                 n_components = min(5, len(S), rank)
@@ -892,29 +904,7 @@ class TensorRingEmbedding(nn.Module):
             
             rank_stat = max(min_rank, rank_stat)
             
-            # 5. Local search around the best rank
-            best_rank = rank_stat
-            best_error = float('inf')
-            
-            # Test a window around the suggested rank
-            search_window = 3
-            test_ranks = torch.arange(max(2, rank_stat - search_window), 
-                                     min(max_rank or rank_stat + search_window + 1, len(S)))
-            
-            for r in test_ranks:
-                if r < 2:
-                    continue
-                    
-                # Approximate reconstruction error using Eckart-Young theorem
-                trunc_S = S[:r]
-                estimated_var = (trunc_S ** 2).sum()
-                estimated_error = 1.0 - estimated_var / total_var
-                
-                if estimated_error < best_error:
-                    best_error = estimated_error
-                    best_rank = r.item()
-            
-            return best_rank
+            return rank_stat
 
     def eigenspace_overlap_score(self, original_matrix: torch.Tensor, k: int = 10) -> float:
         """Compute Eigenspace Overlap Score (EOSk) between original and TR embedding.
@@ -1238,7 +1228,7 @@ class TensorRingEmbedding(nn.Module):
         """
         V, D = embedding_matrix.shape
         emb = cls(V, D, rank=rank, ring_components=ring_components,
-                  init_method="uniform", **kwargs)
+                  init_method=init_method, _skip_init=True, **kwargs)
         emb.cores.initialize(init_method, embedding_matrix)
         return emb
 
@@ -1507,6 +1497,9 @@ class TensorRingEmbedding(nn.Module):
                     break
             new_ranks[j] = max(2, min(current_ranks[j], k))
 
+        # Ensure ring closure invariant: ranks[0] must equal ranks[-1]
+        new_ranks[-1] = new_ranks[0]
+
         if new_ranks != current_ranks:
             logger.info(f"Truncating ranks: {current_ranks} -> {new_ranks}")
             self.structure.ranks = new_ranks
@@ -1517,7 +1510,6 @@ class TensorRingEmbedding(nn.Module):
             )
             self.cores.initialize("svd", matrix)
             self._vocab_strides = self._compute_strides(self.structure.vocab_factor_sizes)
-            self._emb_strides = self._compute_strides(self.structure.emb_factor_sizes)
             self._cache_valid = False
             self._emb_cache = None
 

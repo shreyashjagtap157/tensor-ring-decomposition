@@ -64,7 +64,7 @@ class LSQQuantize(Function):
     def backward(ctx, grad_output):
         x, s = ctx.saved_tensors
         grad_x = grad_output
-        grad_scale = grad_output * (torch.round((x / s).detach()) - x / s)
+        grad_scale = grad_output * (torch.round((x / s).detach()) - (x / s).detach())
         if grad_scale.ndim > ctx.orig_scale_ndim:
             dims = tuple(range(ctx.orig_scale_ndim, grad_scale.ndim))
             grad_scale = grad_scale.sum(dim=dims)
@@ -121,8 +121,7 @@ class NonNegativeClamp(Function):
     @staticmethod
     def backward(ctx, grad_output):
         x, = ctx.saved_tensors
-        grad = grad_output.clone()
-        grad = grad.masked_fill(x < 0, 0.0)
+        grad = grad_output.masked_fill(x < 0, 0.0)
         return grad
 
 
@@ -148,7 +147,6 @@ class QuantizedTensorRingEmbedding(nn.Module):
         self.padding_idx = embedding.padding_idx
         self._dtype = embedding._dtype
         self._vocab_strides = embedding._vocab_strides
-        self._emb_strides = embedding._emb_strides
         self._validate_indices_flag = embedding._validate_indices_flag
         self._max_seq_len = embedding._max_seq_len
         self.qat = qat

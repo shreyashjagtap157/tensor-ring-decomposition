@@ -372,8 +372,13 @@ class TestLoadFromGguf:
                 load_from_gguf("dummy.gguf")
 
     def test_import_error_when_not_installed(self):
-        with pytest.raises(ImportError, match="gguf"):
-            load_from_gguf("dummy.gguf")
+        try:
+            import gguf  # noqa: F401
+            with pytest.raises(FileNotFoundError, match="dummy.gguf"):
+                load_from_gguf("dummy.gguf")
+        except ImportError:
+            with pytest.raises(ImportError, match="gguf"):
+                load_from_gguf("dummy.gguf")
 
     def test_successful_load_with_mock(self, tmp_dir):
         np = pytest.importorskip("numpy")

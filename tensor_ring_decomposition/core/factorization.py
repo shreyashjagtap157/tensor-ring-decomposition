@@ -234,11 +234,17 @@ def compute_ring_structure(
         vocab_factors = factorize_dimension(vocab_size, k)
         emb_factors = factorize_dimension(embedding_dim, m)
 
-    if ranks is not None and len(ranks) < ring_components + 1:
-        raise ValueError(
-            f"ranks length ({len(ranks)}) must be at least "
-            f"ring_components+1 ({ring_components + 1})"
-        )
+    if ranks is not None:
+        if len(ranks) < ring_components + 1:
+            raise ValueError(
+                f"ranks length ({len(ranks)}) must be at least "
+                f"ring_components+1 ({ring_components + 1})"
+            )
+        if ranks[0] != ranks[-1]:
+            raise ValueError(
+                f"ranks[0] ({ranks[0]}) must equal ranks[-1] ({ranks[-1]}) "
+                f"for tensor ring closure"
+            )
     if ranks is None:
         ranks = [rank] * (k + m + 1)
 
