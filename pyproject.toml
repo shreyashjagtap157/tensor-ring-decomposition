@@ -15,12 +15,6 @@ dependencies = [
     "safetensors>=0.4",
     "numpy>=1.24",
 ]
-
-[project.urls]
-Homepage = "https://github.com/shreyashjagtap157/tensor-ring-decomposition"
-Repository = "https://github.com/shreyashjagtap157/tensor-ring-decomposition"
-Documentation = "https://github.com/shreyashjagtap157/tensor-ring-decomposition#readme"
-
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -32,6 +26,11 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
+[project.urls]
+Homepage = "https://github.com/shreyashjagtap157/tensor-ring-decomposition"
+Repository = "https://github.com/shreyashjagtap157/tensor-ring-decomposition"
+Documentation = "https://github.com/shreyashjagtap157/tensor-ring-decomposition#readme"
 
 [project.optional-dependencies]
 dev = [
