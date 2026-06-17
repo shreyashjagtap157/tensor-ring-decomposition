@@ -24,16 +24,17 @@ class CompressionTracker:
         if step % self.log_interval != 0:
             return {}
 
-        metrics = {
+        spectral_norms = self.embedding.spectral_norms()
+        metrics: Dict[str, float] = {
             "tr/compression_ratio": self.embedding.compression_ratio,
             "tr/num_parameters": float(self.embedding.num_parameters),
             "tr/params_saved": float(self.dense_params - self.embedding.num_parameters),
-            "tr/spectral_norms": self.embedding.spectral_norms(),
         }
+        for k, v in spectral_norms.items():
+            metrics[f"tr/spectral_norms/{k}"] = v
 
         for key, value in metrics.items():
-            if key != "tr/spectral_norms":
-                logger.info(f"{key}: {value}")
+            logger.info(f"{key}: {value}")
 
         return metrics
 

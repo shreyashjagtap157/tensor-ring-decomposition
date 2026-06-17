@@ -14,8 +14,8 @@ def factorize_dimension(dim: int, n_factors: int) -> List[int]:
     Strategy: Greedy near-equal product.
 
     Examples:
-        factorize_dimension(50000, 4) -> [9, 9, 9, 68]
-        factorize_dimension(768, 4) -> [3, 4, 8, 8]
+        factorize_dimension(50000, 4) -> [10, 10, 20, 25]
+        factorize_dimension(768, 4) -> [4, 6, 4, 8]
         factorize_dimension(100, 2) -> [10, 10]
 
     Raises:
@@ -133,7 +133,6 @@ def find_highly_factorable_dim(
     # The key insight: for each candidate, the best factorization's max factor
     # divides the candidate. We only need to check candidates that have small
     # divisors, skipping prime numbers and nearly-prime numbers.
-    candidates_checked = 0
     for candidate in range(dim, max_padded + 1):
         # Quick pre-filter: skip primes and near-primes
         sqrt_c = int(math.isqrt(candidate))
@@ -142,7 +141,6 @@ def find_highly_factorable_dim(
             continue
 
         factors = find_best_factorization(candidate, n_factors)
-        candidates_checked += 1
         max_f = max(factors)
         if max_f < best_max_factor:
             best_max_factor = max_f

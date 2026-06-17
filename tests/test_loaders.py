@@ -435,7 +435,7 @@ class TestLoadFromTransformers:
         with patch.dict("sys.modules", {"transformers": fake_transformers}):
             result = load_from_transformers("test-model", cache_dir=tmp_dir)
             assert result.shape == (100, 32)
-            mock_auto_model.from_pretrained.assert_called_once_with("test-model", cache_dir=tmp_dir)
+            mock_auto_model.from_pretrained.assert_called_once_with("test-model", cache_dir=tmp_dir, low_cpu_mem_usage=True)
 
 
 # ---------------------------------------------------------------------------

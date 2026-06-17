@@ -24,6 +24,7 @@ Tests:
 import math
 import time
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import torch
@@ -229,24 +230,22 @@ class TestSpectralRegularization:
 # ── Test 6: Gauge fixing during training ─────────────────────────
 
 class TestGaugeFixing:
-    def test_gauge_fix_applied_after_forward(self):
-        """Gauge fix should be applied at every forward during training."""
+    def test_gauge_fix_applied_via_callback(self):
+        """Gauge fix should be applied when called, e.g. from TensorRingCallback."""
         emb = TensorRingEmbedding(100, 32, rank=4, gauge_fix="left", gauge_fix_interval=1)
-        indices = torch.randint(0, 100, (16,))
-        emb.train()
         old_step = emb.cores._step
-        output = emb(indices)
+        emb.cores._apply_gauge_fix()
         assert emb.cores._step > old_step, "Gauge fix step not incremented"
+        indices = torch.randint(0, 100, (16,))
+        output = emb(indices)
         assert output.shape == (16, 32)
 
     def test_gauge_fix_at_interval(self):
         """Gauge fix should fire only at interval boundaries."""
         emb = TensorRingEmbedding(100, 32, rank=4, gauge_fix="left", gauge_fix_interval=5)
-        emb.train()
         for i in range(10):
-            indices = torch.randint(0, 100, (16,))
-            _ = emb(indices)
-        # Step should be 10 (called every forward)
+            emb.cores._apply_gauge_fix()
+        # Step should be 10 (called 10 times)
         assert emb.cores._step == 10
 
     def test_gauge_fix_none_produces_valid_output(self):

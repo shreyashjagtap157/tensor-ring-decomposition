@@ -1,0 +1,12 @@
+=== COLAB T4 GPU TEST RESULTS ===
+Date: 2026-06-17
+Runtime: Google Colab T4 GPU
+PyTorch: 2.11.0+cu128
+CUDA: Available
+
+Full suite (non-slow): 535 passed, 36 skipped, 3 deselected in 339.66s
+HF-integration tests:   3 passed, 13 deselected in 10.89s
+TOTAL:                 538 passed, 36 skipped, 0 failures, 0 errors
+
+Models tested: bert-base-uncased, gpt2 (replace_in_model, compression)
+All benchmarks pass

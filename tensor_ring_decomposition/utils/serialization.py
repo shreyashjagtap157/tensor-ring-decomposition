@@ -128,7 +128,7 @@ def load(
     embedding = TensorRingEmbedding(
         vocab_size=config["vocab_size"],
         embedding_dim=config["embedding_dim"],
-        rank=config["rank"],
+        rank=config["rank"] if config.get("rank") is not None else max(config.get("ranks", [4])),
         ring_components=config.get("ring_components", 4),
         split_mode=config.get("split_mode", "balanced"),
         init_method="uniform",

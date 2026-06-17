@@ -29,17 +29,12 @@ class HuggingFaceTensorRingEmbedding:
     ) -> TensorRingEmbedding:
         """Load HF model embedding, decompose via TR.
 
-        Uses a lightweight loading approach to avoid downloading the entire
-        model just for the embedding table. Loads with low_cpu_mem_usage=True
-        and immediately discards the model after extracting the embedding weight.
+        Delegates to ``load_from_transformers`` for efficient model loading
+        (low_cpu_mem_usage, cache management), then creates the TR embedding.
         """
-        from transformers import AutoModel
+        from ..loaders.loaders import load_from_transformers
 
-        model = AutoModel.from_pretrained(model_name, low_cpu_mem_usage=True)
-        original_emb = model.get_input_embeddings()
-        weight = original_emb.weight.data.clone()
-
-        del model
+        weight = load_from_transformers(model_name)
         if weight.device.type == "cuda":
             import torch
             torch.cuda.empty_cache()

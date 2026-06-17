@@ -232,7 +232,7 @@ def load_from_transformers(
             "transformers package not found. Install with: pip install transformers"
         )
     
-    model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir)
+    model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir, low_cpu_mem_usage=True)
     emb = model.get_input_embeddings()
     weight = emb.weight.data
     

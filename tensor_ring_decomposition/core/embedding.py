@@ -232,8 +232,27 @@ class TensorRingEmbedding(nn.Module):
         else:
             tp = vocab_size * embedding_dim / 10.0
 
-        R = math.sqrt(tp / (vocab_size + embedding_dim))
-        return max(2, int(round(R)))
+        from .factorization import compute_ring_structure
+
+        def param_fn(r: int) -> int:
+            struct = compute_ring_structure(vocab_size, embedding_dim, ring_components, r)
+            total = 0
+            for i in range(struct.n_vocab_cores):
+                total += struct.vocab_factor_sizes[i] * r * r
+            for i in range(struct.n_emb_cores):
+                total += struct.emb_factor_sizes[i] * r * r
+            return total
+
+        lo, hi = 2, max(2, int(math.isqrt(vocab_size * embedding_dim)))
+        best = 2
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if param_fn(mid) <= tp:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        return max(2, best)
 
     @staticmethod
     def optimal_rank(
@@ -348,19 +367,26 @@ class TensorRingEmbedding(nn.Module):
         elif target_mse:
             # Use SVD spectrum for MSE-based target estimation
             with torch.no_grad():
-                _, S, _ = torch.linalg.svd(embedding_matrix.to(torch.float32), full_matrices=False)
+                matrix_f32 = embedding_matrix.to(torch.float32)
+                Vm, Dm = matrix_f32.shape
+                if min(Vm, Dm) > 200:
+                    _, S, _ = torch.svd_lowrank(matrix_f32, q=min(Vm, Dm, 200))
+                else:
+                    _, S, _ = torch.linalg.svd(matrix_f32, full_matrices=False)
                 S_sq = S ** 2
                 total_var = S_sq.sum()
                 cum_var = torch.cumsum(S_sq, dim=0)
-                for r in range(2, len(S)):
-                    mse_est = 1.0 - (cum_var[r - 1] / total_var)
-                    if mse_est <= target_mse:
-                        elapsed = (time.monotonic() - t0) * 1000
-                        return cls._build_autotune_result(
-                            rank=r, V=V, D=D, ring_components=ring_components,
-                            dense=dense, mse=mse_est, elapsed=elapsed,
-                            verbose=verbose,
-                        )
+                mse_est = 1.0 - (cum_var[:-1] / total_var)
+                candidate = torch.where(mse_est <= target_mse)[0]
+                if candidate.numel() > 0:
+                    r = candidate[0].item() + 2
+                    mse_val = mse_est[candidate[0]].item()
+                    elapsed = (time.monotonic() - t0) * 1000
+                    return cls._build_autotune_result(
+                        rank=r, V=V, D=D, ring_components=ring_components,
+                        dense=dense, mse=mse_val, elapsed=elapsed,
+                        verbose=verbose,
+                    )
                 # Fallback: use very high rank
                 rank = max(2, len(S) // 2)
                 elapsed = (time.monotonic() - t0) * 1000
@@ -569,10 +595,6 @@ class TensorRingEmbedding(nn.Module):
             from ..utils.validation import validate_indices
             validate_indices(indices, self.vocab_size, self.padding_idx)
 
-        # Automatic gauge fixing during training
-        if self.training:
-            self.cores._apply_gauge_fix()
-
         original_shape = indices.shape
         flat = indices.view(-1)
 
@@ -632,7 +654,7 @@ class TensorRingEmbedding(nn.Module):
         return {
             "vocab_size": self.vocab_size,
             "embedding_dim": self.embedding_dim,
-            "rank": self._rank,
+            "rank": self._rank if self._rank is not None else max(self.structure.ranks),
             "ranks": self.structure.ranks,
             "ring_components": self.ring_components,
             "split_mode": self.split_mode,
@@ -751,10 +773,12 @@ class TensorRingEmbedding(nn.Module):
                 reg_coeff = min(0.1, 1.0 / max(rank, 1) ** 0.5)
                 n_components = min(5, len(S), rank)
                 total_var = (S ** 2).sum() + 1e-10
-                cum_var_before = torch.zeros(n_components, device=S.device)
-                if n_components > 1:
+                if n_components <= 1:
+                    spectrum_penalty = 0.0
+                else:
+                    cum_var_before = torch.zeros(n_components, device=S.device)
                     cum_var_before[1:] = (S[:n_components-1] ** 2).cumsum(dim=0)
-                spectrum_penalty = (1.0 - cum_var_before / total_var).clamp(min=0.0).sum()
+                    spectrum_penalty = (1.0 - cum_var_before / total_var).clamp(min=0.0).sum()
                 return (base_error + spectrum_penalty * reg_coeff).item()
 
             if adaptive_weighting and cov_matrix is None and input_probs is None:
@@ -804,7 +828,15 @@ class TensorRingEmbedding(nn.Module):
             Recommended rank based on spectral gap analysis.
         """
         with torch.no_grad():
-            _, S, _ = torch.linalg.svd(matrix.to(torch.float32), full_matrices=False)
+            matrix_f32 = matrix.to(torch.float32)
+            V, D = matrix_f32.shape
+            k = min(V, D)
+            # Use randomized SVD unless matrix is small
+            if k > 200:
+                q = min(k // 2, 200)
+                _, S, _ = torch.svd_lowrank(matrix_f32, q=q)
+            else:
+                _, S, _ = torch.linalg.svd(matrix_f32, full_matrices=False)
             
             # 1. Statistical significance testing for singular values
             S_avg = S.mean()
@@ -833,8 +865,8 @@ class TensorRingEmbedding(nn.Module):
                 gap_size = rel_drops[max_gap_idx].item()
                 
                 if gap_size > 0.5:  # Significant gap
-                    # Use gap position as potential rank
-                    gap_rank = max_gap_idx.item() + 2
+                    # Use gap position as potential rank (off-by-one fix: +1 not +2)
+                    gap_rank = max_gap_idx.item() + 1
                     rank_stat = min(rank_stat, gap_rank)
                     
                     # Refine: check if gap rank satisfies variance threshold
@@ -937,9 +969,10 @@ class TensorRingEmbedding(nn.Module):
             V = original_matrix.shape[0]
             reconstructed = self.reconstruct()
 
-            if sample_size is not None and V > sample_size:
+            sample = sample_size if sample_size is not None else (2000 if V > 2000 else None)
+            if sample is not None and V > sample:
                 return self._trustworthiness_sampled(
-                    original_matrix, reconstructed, n_neighbors, metric, sample_size
+                    original_matrix, reconstructed, n_neighbors, metric, sample
                 )
 
             orig_dist = self._pairwise_distances(original_matrix, metric)
@@ -980,9 +1013,10 @@ class TensorRingEmbedding(nn.Module):
             V = original_matrix.shape[0]
             reconstructed = self.reconstruct()
 
-            if sample_size is not None and V > sample_size:
+            sample = sample_size if sample_size is not None else (2000 if V > 2000 else None)
+            if sample is not None and V > sample:
                 return self._continuity_sampled(
-                    original_matrix, reconstructed, n_neighbors, metric, sample_size
+                    original_matrix, reconstructed, n_neighbors, metric, sample
                 )
 
             orig_dist = self._pairwise_distances(original_matrix, metric)
@@ -1012,7 +1046,12 @@ class TensorRingEmbedding(nn.Module):
 
     def _trustworthiness_sampled(self, original_matrix: torch.Tensor, reconstructed: torch.Tensor,
                                    n_neighbors: int, metric: str, sample_size: int) -> float:
-        """Fast approximate trustworthiness via stratified sampling."""
+        """Fast approximate trustworthiness via stratified sampling.
+        
+        Note: Computes neighborhoods within the sample only, which is an
+        approximation of the full-space metric. For exact results on small V,
+        use trustworthiness() without sample_size.
+        """
         V = original_matrix.shape[0]
         n_sample = min(sample_size, V)
         indices = torch.randperm(V)[:n_sample]
@@ -1039,8 +1078,13 @@ class TensorRingEmbedding(nn.Module):
         return max(0.0, min(1.0, T))
 
     def _continuity_sampled(self, original_matrix: torch.Tensor, reconstructed: torch.Tensor,
-                             n_neighbors: int, metric: str, sample_size: int) -> float:
-        """Fast approximate continuity via stratified sampling."""
+                              n_neighbors: int, metric: str, sample_size: int) -> float:
+        """Fast approximate continuity via stratified sampling.
+        
+        Note: Computes neighborhoods within the sample only, which is an
+        approximation of the full-space metric. For exact results on small V,
+        use continuity() without sample_size.
+        """
         V = original_matrix.shape[0]
         n_sample = min(sample_size, V)
         indices = torch.randperm(V)[:n_sample]
@@ -1099,22 +1143,23 @@ class TensorRingEmbedding(nn.Module):
 
         return param_groups
 
-    def gradient_accumulation_forward(self, indices: torch.Tensor, accum_steps: int = 4) -> torch.Tensor:
-        """Forward pass with gradient accumulation support for large effective batches.
+    def batched_forward(self, indices: torch.Tensor, accum_steps: int = 4) -> torch.Tensor:
+        """Forward pass split into micro-batches for memory efficiency.
 
-        Divides the batch into accum_steps micro-batches and accumulates
-        the embedding output (not gradients) before returning. This is useful
-        when GPU memory only fits a small batch but you want larger effective batch.
+        Divides the batch into accum_steps micro-batches and concatenates
+        the embedding output before returning. This is useful when GPU
+        memory only fits a small batch.
 
-        Note: Actual gradient accumulation (optimizer step every N batches)
-        should be handled at the training loop level.
+        Note: This accumulates the output (not gradients). Actual gradient
+        accumulation (optimizer step every N batches) should be handled at
+        the training loop level.
 
         Args:
             indices: Batch of token indices.
             accum_steps: Number of micro-batches.
 
         Returns:
-            Averaged embedding output over all micro-batches.
+            Concatenated embedding output over all micro-batches.
         """
         B = indices.shape[0]
         micro_batch_size = max(1, B // accum_steps)
@@ -1403,8 +1448,7 @@ class TensorRingEmbedding(nn.Module):
         """
         p = Path(path)
         if p.suffix == ".onnx":
-            logger.warning("ONNX files require an ONNX runtime to load; use torch.jit.load for .torchscript")
-            return torch.jit.load(str(p), map_location=device)
+            raise RuntimeError("ONNX files require an ONNX runtime (e.g., onnxruntime). Cannot load with torch.jit.load.")
         return torch.jit.load(str(p), map_location=device)
 
     def compile_forward(self, mode: Optional[str] = None, fullgraph: bool = False):
@@ -1461,9 +1505,7 @@ class TensorRingEmbedding(nn.Module):
                     k += 1
                 else:
                     break
-            # Calculate rank using percentile instead of linear interpolation
-            percentile = k / len(S) if len(S) > 0 else 0.0
-            new_ranks[j] = max(2, min(current_ranks[j], int(percentile * current_ranks[j])))
+            new_ranks[j] = max(2, min(current_ranks[j], k))
 
         if new_ranks != current_ranks:
             logger.info(f"Truncating ranks: {current_ranks} -> {new_ranks}")
@@ -1715,9 +1757,11 @@ class ZipfHybridTensorRingEmbedding(nn.Module):
         if self._dtype == torch.float16:
             raise TypeError("fp16 not supported. Use bf16 or fp32.")
 
-        # Pre-allocate output tensor to avoid memory reallocations
+        device = next(self.parameters()).device
+        if indices.device != device:
+            indices = indices.to(device)
         out = torch.empty(
-            *indices.shape, self.embedding_dim, dtype=self._dtype, device=indices.device
+            *indices.shape, self.embedding_dim, dtype=self._dtype, device=device
         )
 
         # Map to registered buffers

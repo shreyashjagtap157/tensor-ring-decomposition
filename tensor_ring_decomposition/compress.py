@@ -71,9 +71,10 @@ def compress(
                 try:
                     matrix = load_embedding_matrix(source, device=device)
                 except Exception as e:
-                    logger.warning(f"Failed to load matrix for {source}: {e}. Falling back to uniform init.")
-                    # If loading fails, we force uniform init
-                    # We'll handle this by setting init_method to "uniform" below
+                    logger.warning(f"Failed to load matrix for {source}: {e}. Falling back to uniform init. "
+                                   f"This may produce lower-quality embeddings. "
+                                   f"To avoid this, ensure the model is accessible or provide a tensor directly.")
+                    # If loading fails, force uniform init
                 
         if profile is None:
             # Assume it's a file path or direct HF model name

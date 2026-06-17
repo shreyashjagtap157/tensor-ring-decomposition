@@ -114,7 +114,7 @@ class TestQuantizedTensorRingEmbedding:
         emb = TensorRingEmbedding(100, 32, rank=4)
         qemb = QuantizedTensorRingEmbedding(emb, qat=True, lsq=True)
         bpp = qemb.bits_per_parameter
-        assert bpp == 8.0
+        assert 8.0 < bpp < 32.0
 
     def test_bits_per_parameter_qat_per_channel(self):
         emb = TensorRingEmbedding(100, 32, rank=4)

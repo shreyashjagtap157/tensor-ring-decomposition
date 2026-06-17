@@ -54,7 +54,8 @@ class QualityGate:
                 return False
 
         if metrics_checked == 0:
-            logger.warning(
+            log_fn = logger.info if not self.triggered else logger.warning
+            log_fn(
                 f"QualityGate: No metrics from baseline matched current_metrics "
                 f"(baseline keys={list(self.baseline.keys())}, "
                 f"current keys={list(current_metrics.keys())})"

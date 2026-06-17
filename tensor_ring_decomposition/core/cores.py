@@ -106,7 +106,7 @@ class TensorRingCores(nn.Module):
         elif init_method == "tr_svd":
             if embedding_matrix is None:
                 raise ValueError("TR-SVD init requires embedding_matrix")
-            self._init_tr_svd(embedding_matrix)
+            self._init_fast_training(embedding_matrix)
         elif init_method == "als":
             if embedding_matrix is None:
                 raise ValueError("ALS init requires embedding_matrix")
@@ -131,8 +131,8 @@ class TensorRingCores(nn.Module):
         self._init_info = {"method": init_method, "duration_s": elapsed}
         logger.info(f"Init '{init_method}' completed in {elapsed:.2f}s")
 
-    def _init_tr_svd(self, matrix: torch.Tensor) -> float:
-        """Fast TR initialization with SVD-informed short training.
+    def _init_fast_training(self, matrix: torch.Tensor) -> float:
+        """Fast TR initialization with short training schedule.
 
         Due to fundamental structural differences between matrix SVD and
         tensor ring decomposition, exact training-free TR-SVD is not
@@ -145,7 +145,7 @@ class TensorRingCores(nn.Module):
         with ``_train_to_matrix(steps=0)`` (random init, no training).
         """
         self._init_xavier("uniform")
-        logger.info("TR-SVD: running 700-step refinement...")
+        logger.info("fast_training: running 700-step refinement...")
         self._train_to_matrix(matrix, steps=700, lr=0.02, batch_size=32768)
 
         GaugeFixer.fix_left(self.vocab_cores)
@@ -155,7 +155,7 @@ class TensorRingCores(nn.Module):
         reconstructed = self._reconstruct_tr()
         norm_m = torch.norm(matrix.to(dtype))
         error = torch.norm(matrix.to(dtype) - reconstructed) / norm_m if norm_m > 0 else torch.tensor(0.0)
-        logger.info(f"TR-SVD init complete. recon_error={error:.4f}")
+        logger.info(f"fast_training init complete. recon_error={error:.4f}")
 
         return error.item()
 

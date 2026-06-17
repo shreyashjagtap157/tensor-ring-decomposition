@@ -296,18 +296,11 @@ class TestExportEdgeCases:
             with pytest.raises((FileNotFoundError, OSError, RuntimeError)):
                 emb.export(path, format=ExportFormat.TORCHSCRIPT)
 
-    def test_load_exported_onnx_logs_warning(self, caplog):
+    def test_load_exported_onnx_raises_error(self):
         emb = _make_embedding()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             onnx_path = Path(tmpdir) / "tr_embedding.onnx"
             onnx_path.write_text("fake onnx content")
-            with caplog.at_level(logging.WARNING):
-                try:
-                    TensorRingEmbedding.load_exported(str(onnx_path))
-                except (RuntimeError, FileNotFoundError):
-                    pass
-            assert any(
-                "ONNX files require an ONNX runtime" in msg
-                for msg in caplog.messages
-            )
+            with pytest.raises(RuntimeError, match="ONNX files require an ONNX runtime"):
+                TensorRingEmbedding.load_exported(str(onnx_path))
