@@ -17,7 +17,7 @@ import json
 import logging
 import math
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, Union
@@ -30,7 +30,7 @@ import torch.distributed as dist
 if TYPE_CHECKING:
     from ..models.registry import ModelProfile
 
-from .factorization import RingStructure, compute_ring_structure, compute_mixed_radix_strides
+from .factorization import compute_ring_structure, compute_mixed_radix_strides
 from .cores import TensorRingCores
 from .contraction import (
     compute_emb_precontraction,
@@ -104,7 +104,7 @@ class TensorRingEmbedding(nn.Module):
         spectral_reg_coeff: float = 0.0,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = torch.float32,
-        validate_indices: bool = True,
+        validate_indices: bool = False,
         auto_pad: bool = True,
         max_padding_pct: float = 0.15,
         _skip_init: bool = False,
@@ -168,6 +168,7 @@ class TensorRingEmbedding(nn.Module):
         self._cache_valid: bool = False
 
         self._max_seq_len = max_seq_len
+        self._used_explicit_ranks = ranks is not None
 
         logger.info(
             f"TensorRingEmbedding initialized: V={vocab_size}, D={embedding_dim}, "
@@ -184,13 +185,31 @@ class TensorRingEmbedding(nn.Module):
         """Decompose flat token IDs into factor indices via mixed-radix encoding."""
         factor_indices = []
         remaining = flat_indices
+        # Three regimes:
+        #   - padding_idx set: clamp OOB to the last factor slot (legal
+        #     when emitting a pad token).
+        #   - validate_indices=True: raise loudly on OOB (debug mode).
+        #   - neither: rely on the invariant that mixed-radix of in-range
+        #   ids
+        #     produces in-range factor ids — no clamp, no validation, no
+        #     CUDA syncs. Caller is responsible for in-range ids.
         for i, stride in enumerate(strides):
             if i < len(strides) - 1:
                 idx = remaining // stride
                 remaining = remaining % stride
             else:
                 idx = remaining
-            factor_indices.append(idx.clamp(0, factor_sizes[i] - 1))
+            if self.padding_idx is not None:
+                idx = idx.clamp(0, factor_sizes[i] - 1)
+            elif self._validate_indices_flag and (
+                idx.min().item() < 0 or idx.max().item() >= factor_sizes[i]
+            ):
+                raise IndexError(
+                    f"Factor index out of range for factor {i}: "
+                    f"values in [{idx.min().item()}, {idx.max().item()}], "
+                    f"expected [0, {factor_sizes[i] - 1}]"
+                )
+            factor_indices.append(idx)
         return factor_indices
 
     def _validate_compression_config(
@@ -518,24 +537,13 @@ class TensorRingEmbedding(nn.Module):
         # Ensure rank is at least 2 and fits within TR constraints
         rank = max(2, rank)
         
-        # Binary search to find the best rank satisfying parameter budget
         V, D = matrix.shape
         dense = V * D
-        
-        def param_count(r):
-            struct = compute_ring_structure(V, D, ring_components, r)
-            total = 0
-            for i in range(struct.n_vocab_cores):
-                total += struct.vocab_factor_sizes[i] * r * r
-            for i in range(struct.n_emb_cores):
-                total += struct.emb_factor_sizes[i] * r * r
-            return total
-        
         lo, hi = 2, rank
         best = rank
         while lo <= hi:
             mid = (lo + hi) // 2
-            if param_count(mid) <= dense / 2:  # At least 2x compression
+            if cls._param_count_at_rank(V, D, ring_components, mid) <= dense / 2:
                 best = mid
                 lo = mid + 1
             else:
@@ -544,10 +552,10 @@ class TensorRingEmbedding(nn.Module):
         return best
 
     @staticmethod
-    def _param_count_at_rank(V: int, D: int, ring_components: int, rank: int) -> int:
+    def _param_count_at_rank(V: int, D: int, ring_components: int, rank: int, auto_pad: bool = True) -> int:
         """Compute parameter count for a given rank without constructing the embedding."""
         from .factorization import compute_ring_structure
-        struct = compute_ring_structure(V, D, ring_components, rank)
+        struct = compute_ring_structure(V, D, ring_components, rank, auto_pad=auto_pad)
         total = 0
         for i in range(struct.n_vocab_cores):
             total += struct.vocab_factor_sizes[i] * rank * rank
@@ -557,22 +565,13 @@ class TensorRingEmbedding(nn.Module):
 
     def _vocab_chain(self, flat_indices: torch.Tensor) -> torch.Tensor:
         """Compute vocab chain: decompose indices, gather, chain bmm."""
-        factor_indices = self._decompose_indices(
+        from .contraction import gather_vocab_cores
+        return gather_vocab_cores(
             flat_indices,
+            list(self.cores.vocab_cores),
             self.structure.vocab_factor_sizes,
-            self._vocab_strides,
+            strides=self._vocab_strides,
         )
-
-        gathered = [
-            core[factor_indices[i]]
-            for i, core in enumerate(self.cores.vocab_cores)
-        ]
-
-        result = gathered[0]
-        for core_gathered in gathered[1:]:
-            result = torch.bmm(result, core_gathered)
-
-        return result
 
     def _compute_emb_contraction(self) -> torch.Tensor:
         """Compute embedding cores precontraction. Returns (R, D, R)."""
@@ -679,6 +678,8 @@ class TensorRingEmbedding(nn.Module):
             "dtype": str(self._dtype) if self._dtype else "None",
             "vocab_cores": len(self.cores.vocab_cores),
             "emb_cores": len(self.cores.emb_cores),
+            "used_explicit_ranks": self._used_explicit_ranks,
+            "structure_ranks": self.structure.ranks,
         }
 
     def to_json(self, path: str) -> None:
@@ -739,6 +740,42 @@ class TensorRingEmbedding(nn.Module):
             # Fall back to standard Frobenius norm
             return self.reconstruction_error(original_matrix)
 
+    def _compute_spectral_penalty(self, original_matrix: torch.Tensor) -> float:
+        """Compute spectral regularization penalty for v2 error."""
+        matrix_f32 = original_matrix.to(torch.float32)
+        Vm, Dm = matrix_f32.shape
+        if min(Vm, Dm) > 200:
+            _, S, _ = torch.svd_lowrank(matrix_f32, q=min(min(Vm, Dm), 10))
+        else:
+            S = torch.linalg.svdvals(matrix_f32)
+        rank = self.rank
+        reg_coeff = min(0.1, 1.0 / max(rank, 1) ** 0.5)
+        n_components = min(5, len(S), rank)
+        total_var = (S ** 2).sum() + 1e-10
+        if n_components <= 1:
+            return 0.0
+        cum_var_before = torch.zeros(n_components, device=S.device)
+        cum_var_before[1:] = (S[:n_components-1] ** 2).cumsum(dim=0)
+        spectrum_penalty = (1.0 - cum_var_before / total_var).clamp(min=0.0).sum()
+        return (spectrum_penalty * reg_coeff).item()
+
+    def _compute_cov_weighted_error(self, diff: torch.Tensor, cov_matrix: torch.Tensor) -> float:
+        """Compute covariance-weighted reconstruction error."""
+        cov_reg = cov_matrix.to(diff.dtype) + torch.eye(
+            cov_matrix.shape[0], device=cov_matrix.device
+        ) * 1e-6
+        weighted_diff = diff @ cov_reg
+        trace = (weighted_diff * diff).sum()
+        return torch.sqrt(trace / max(diff.shape[0] * diff.shape[1], 1)).item()
+
+    def _compute_prob_weighted_error(self, diff: torch.Tensor, input_probs: torch.Tensor,
+                                      orig_norm: float) -> float:
+        """Compute probability-weighted reconstruction error."""
+        probs = input_probs.to(diff.device, diff.dtype)
+        probs = probs / probs.sum()
+        weighted = diff * probs.sqrt().unsqueeze(1)
+        return (weighted.norm() / orig_norm).item()
+
     def distribution_aware_reconstruction_error_v2(
         self,
         original_matrix: torch.Tensor,
@@ -757,8 +794,7 @@ class TensorRingEmbedding(nn.Module):
             cov_matrix: Precomputed (D, D) covariance matrix.
             input_probs: (V,) token frequency distribution.
             adaptive_weighting: If True and no cov_matrix/probs given, falls back
-                               to standard reconstruction error (inverse-singular-value
-                               weighting not yet implemented).
+                               to standard reconstruction error.
             spectral_regularization: Add penalty for high-variance components not
                                     captured by the TR decomposition.
 
@@ -775,40 +811,17 @@ class TensorRingEmbedding(nn.Module):
             base_error = torch.norm(diff) / orig_norm
 
             if spectral_regularization:
-                matrix_f32 = original_matrix.to(torch.float32)
-                Vm, Dm = matrix_f32.shape
-                if min(Vm, Dm) > 200:
-                    _, S, _ = torch.svd_lowrank(matrix_f32, q=min(min(Vm, Dm), 10))
-                else:
-                    S = torch.linalg.svdvals(matrix_f32)
-                rank = self.rank
-                reg_coeff = min(0.1, 1.0 / max(rank, 1) ** 0.5)
-                n_components = min(5, len(S), rank)
-                total_var = (S ** 2).sum() + 1e-10
-                if n_components <= 1:
-                    spectrum_penalty = 0.0
-                else:
-                    cum_var_before = torch.zeros(n_components, device=S.device)
-                    cum_var_before[1:] = (S[:n_components-1] ** 2).cumsum(dim=0)
-                    spectrum_penalty = (1.0 - cum_var_before / total_var).clamp(min=0.0).sum()
-                return (base_error + spectrum_penalty * reg_coeff).item()
-
-            if adaptive_weighting and cov_matrix is None and input_probs is None:
-                return base_error.item()
+                penalty = self._compute_spectral_penalty(original_matrix)
+                return base_error.item() + penalty
 
             if cov_matrix is not None:
-                cov_reg = cov_matrix.to(diff.dtype) + torch.eye(
-                    cov_matrix.shape[0], device=cov_matrix.device
-                ) * 1e-6
-                weighted_diff = diff @ cov_reg
-                trace = (weighted_diff * diff).sum()
-                return torch.sqrt(trace / max(original_matrix.numel(), 1)).item()
+                return self._compute_cov_weighted_error(diff, cov_matrix)
 
             if input_probs is not None:
-                probs = input_probs.to(diff.device, diff.dtype)
-                probs = probs / probs.sum()
-                weighted = diff * probs.sqrt().unsqueeze(1)
-                return (weighted.norm() / orig_norm).item()
+                return self._compute_prob_weighted_error(diff, input_probs, orig_norm)
+
+            if adaptive_weighting:
+                return base_error.item()
 
             return self.reconstruction_error(original_matrix)
 
@@ -928,11 +941,11 @@ class TensorRingEmbedding(nn.Module):
             U_orig, S_orig, V_orig = torch.svd_lowrank(original_matrix.to(torch.float32), q=q)
             U_rec, S_rec, V_rec = torch.svd_lowrank(reconstructed.to(torch.float32), q=q)
 
-            k = min(k, S_orig.shape[0], S_rec.shape[0])
-            if k <= 0:
+            n_components = min(k, S_orig.shape[0], S_rec.shape[0])
+            if n_components <= 0:
                 return 0.0
 
-            proj = V_orig[:k] @ V_rec[:k].T
+            proj = V_orig[:n_components] @ V_rec[:n_components].T
             overlap = torch.trace(proj @ proj.T) / k
             return overlap.item()
 
@@ -971,17 +984,39 @@ class TensorRingEmbedding(nn.Module):
             orig_knn_indices = torch.topk(orig_dist, n_neighbors + 1, largest=False).indices[:, 1:]
             rec_knn_indices = torch.topk(rec_dist, n_neighbors + 1, largest=False).indices[:, 1:]
 
-            trustworthiness_sum = 0.0
-            for i in range(V):
-                rec_neighbors = set(rec_knn_indices[i].tolist())
-                orig_neighbors = set(orig_knn_indices[i].tolist())
-                for j, neighbor in enumerate(rec_neighbors - orig_neighbors):
-                    rank = (orig_dist[i, orig_knn_indices[i]] < orig_dist[i, neighbor]).sum().item()
-                    trustworthiness_sum += max(0, rank - n_neighbors)
+            # Vectorized computation of trustworthiness
+            # For each point i, for each rec neighbor j not in orig neighbors:
+            #   rank = number of points in ORIGINAL space closer to i than j is
+            #   contribution = max(0, rank - n_neighbors)
+
+            row_indices = torch.arange(V, device=orig_dist.device).unsqueeze(1).expand(-1, n_neighbors)
+
+            # Get original-space distance from i to each reconstructed neighbor j
+            rec_indices_in_orig = rec_knn_indices  # (V, n_neighbors)
+            orig_dist_to_rec = orig_dist[row_indices, rec_indices_in_orig]  # (V, n_neighbors)
+
+            # Count how many original neighbors are closer than each reconstructed neighbor
+            # in the ORIGINAL space (proper single-space comparison)
+            # orig_knn_dists[i, j] = distance from i to its j-th ORIGINAL neighbor
+            # orig_dist_to_rec[i, l] = distance from i to its l-th RECONSTRUCTED neighbor (in original space)
+            orig_knn_dists = orig_dist[row_indices, orig_knn_indices]  # (V, n_neighbors)
+            closer_mask = (orig_knn_dists.unsqueeze(-1) < orig_dist_to_rec.unsqueeze(1)).float()  # (V, n_neighbors, n_neighbors)
+            closer_counts = closer_mask.sum(dim=1)  # (V, n_neighbors)
+
+            # Create mask for rec neighbors not in orig neighbors
+            rec_knn_expanded_flat = rec_knn_indices.unsqueeze(-1)  # (V, n_neighbors, 1)
+            orig_knn_expanded_flat = orig_knn_indices.unsqueeze(1)  # (V, 1, n_neighbors)
+            in_orig_mask = (rec_knn_expanded_flat == orig_knn_expanded_flat).any(dim=2).float()  # (V, n_neighbors)
+            not_in_orig_mask = 1.0 - in_orig_mask
+
+            # Rank is 1-indexed: rank = closer_counts + 1
+            # Penalty = max(0, rank - n_neighbors) = max(0, closer_counts + 1 - n_neighbors)
+            contributions = torch.relu(closer_counts - (n_neighbors - 1)) * not_in_orig_mask  # (V, n_neighbors)
+            trustworthiness_sum = contributions.sum()
 
             denom = V * n_neighbors * (2 * V - 3 * n_neighbors - 1)
             T = 1.0 - (2.0 / denom) * trustworthiness_sum if denom > 0 else 1.0
-            return max(0.0, min(1.0, T))
+            return max(0.0, min(1.0, float(T)))
 
     def continuity(self, original_matrix: torch.Tensor, n_neighbors: int = 15,
                    metric: str = "euclidean", sample_size: Optional[int] = None) -> float:
@@ -1015,17 +1050,37 @@ class TensorRingEmbedding(nn.Module):
             orig_knn_indices = torch.topk(orig_dist, n_neighbors + 1, largest=False).indices[:, 1:]
             rec_knn_indices = torch.topk(rec_dist, n_neighbors + 1, largest=False).indices[:, 1:]
 
-            continuity_sum = 0.0
-            for i in range(V):
-                orig_neighbors = set(orig_knn_indices[i].tolist())
-                rec_neighbors = set(rec_knn_indices[i].tolist())
-                for j, neighbor in enumerate(orig_neighbors - rec_neighbors):
-                    rank = (rec_dist[i, rec_knn_indices[i]] < rec_dist[i, neighbor]).sum().item()
-                    continuity_sum += max(0, rank - n_neighbors)
+            # Vectorized computation of continuity
+            # For each point i, for each orig neighbor j not in rec neighbors:
+            #   rank = number of rec neighbors closer to i than j is
+            #   contribution = max(0, rank - n_neighbors)
+
+            row_indices = torch.arange(V, device=orig_dist.device).unsqueeze(1).expand(-1, n_neighbors)
+
+            # Get reconstructed-space distance from i to each original neighbor j
+            orig_indices_in_rec = orig_knn_indices
+            rec_dist_to_orig = rec_dist[row_indices, orig_indices_in_rec]  # (V, n_neighbors)
+
+            # Count how many reconstructed neighbors are closer than each original neighbor
+            # in the RECONSTRUCTED space (proper single-space comparison)
+            rec_knn_dists = rec_dist[row_indices, rec_knn_indices]  # (V, n_neighbors)
+            closer_mask = (rec_knn_dists.unsqueeze(-1) < rec_dist_to_orig.unsqueeze(1)).float()  # (V, n_neighbors, n_neighbors)
+            closer_counts = closer_mask.sum(dim=1)  # (V, n_neighbors)
+
+            # Create mask for orig neighbors not in rec neighbors
+            orig_knn_expanded_flat = orig_knn_indices.unsqueeze(-1)  # (V, n_neighbors, 1)
+            rec_knn_expanded_flat = rec_knn_indices.unsqueeze(1)  # (V, 1, n_neighbors)
+            in_rec_mask = (orig_knn_expanded_flat == rec_knn_expanded_flat).any(dim=2).float()  # (V, n_neighbors)
+            not_in_rec_mask = 1.0 - in_rec_mask
+
+            # Rank is 1-indexed: rank = closer_counts + 1
+            # Penalty = max(0, rank - n_neighbors) = max(0, closer_counts + 1 - n_neighbors)
+            contributions = torch.relu(closer_counts - (n_neighbors - 1)) * not_in_rec_mask  # (V, n_neighbors)
+            continuity_sum = contributions.sum()
 
             denom = V * n_neighbors * (2 * V - 3 * n_neighbors - 1)
             C = 1.0 - (2.0 / denom) * continuity_sum if denom > 0 else 1.0
-            return max(0.0, min(1.0, C))
+            return max(0.0, min(1.0, float(C)))
 
     def _pairwise_distances(self, matrix: torch.Tensor, metric: str = "euclidean") -> torch.Tensor:
         """Compute pairwise distance matrix."""
@@ -1055,17 +1110,24 @@ class TensorRingEmbedding(nn.Module):
         orig_knn = torch.topk(orig_dist, n_neighbors + 1, largest=False).indices[:, 1:]
         rec_knn = torch.topk(rec_dist, n_neighbors + 1, largest=False).indices[:, 1:]
 
-        t_sum = 0.0
-        for i in range(n_sample):
-            rec_neighbors = set(rec_knn[i].tolist())
-            orig_neighbors = set(orig_knn[i].tolist())
-            for j, neighbor in enumerate(rec_neighbors - orig_neighbors):
-                rank = (orig_dist[i, orig_knn[i]] < orig_dist[i, neighbor]).sum().item()
-                t_sum += max(0, rank - n_neighbors)
+        row_indices = torch.arange(n_sample, device=orig_dist.device).unsqueeze(1).expand(-1, n_neighbors)
+        orig_knn_dists = orig_dist[row_indices, orig_knn]
+
+        # Use original-space distances to reconstructed neighbors (single-space comparison)
+        orig_dist_to_rec = orig_dist[row_indices, rec_knn]
+        closer_mask = (orig_knn_dists.unsqueeze(-1) < orig_dist_to_rec.unsqueeze(1)).float()
+        closer_counts = closer_mask.sum(dim=1)
+
+        rec_knn_expanded = rec_knn.unsqueeze(-1)
+        orig_knn_expanded = orig_knn.unsqueeze(1)
+        in_orig_mask = (rec_knn_expanded == orig_knn_expanded).any(dim=2).float()
+        not_in_orig_mask = 1.0 - in_orig_mask
+
+        t_sum = (torch.relu(closer_counts - (n_neighbors - 1)) * not_in_orig_mask).sum()
 
         denom = n_sample * n_neighbors * (2 * n_sample - 3 * n_neighbors - 1)
         T = 1.0 - (2.0 / denom) * t_sum if denom > 0 else 1.0
-        return max(0.0, min(1.0, T))
+        return max(0.0, min(1.0, float(T)))
 
     def _continuity_sampled(self, original_matrix: torch.Tensor, reconstructed: torch.Tensor,
                               n_neighbors: int, metric: str, sample_size: int) -> float:
@@ -1088,17 +1150,24 @@ class TensorRingEmbedding(nn.Module):
         orig_knn = torch.topk(orig_dist, n_neighbors + 1, largest=False).indices[:, 1:]
         rec_knn = torch.topk(rec_dist, n_neighbors + 1, largest=False).indices[:, 1:]
 
-        c_sum = 0.0
-        for i in range(n_sample):
-            orig_neighbors = set(orig_knn[i].tolist())
-            rec_neighbors = set(rec_knn[i].tolist())
-            for j, neighbor in enumerate(orig_neighbors - rec_neighbors):
-                rank = (rec_dist[i, rec_knn[i]] < rec_dist[i, neighbor]).sum().item()
-                c_sum += max(0, rank - n_neighbors)
+        row_indices = torch.arange(n_sample, device=orig_dist.device).unsqueeze(1).expand(-1, n_neighbors)
+        rec_knn_dists = rec_dist[row_indices, rec_knn]
+
+        # Use reconstructed-space distances to original neighbors (single-space comparison)
+        rec_dist_to_orig = rec_dist[row_indices, orig_knn]
+        closer_mask = (rec_knn_dists.unsqueeze(-1) < rec_dist_to_orig.unsqueeze(1)).float()
+        closer_counts = closer_mask.sum(dim=1)
+
+        orig_knn_expanded = orig_knn.unsqueeze(-1)
+        rec_knn_expanded = rec_knn.unsqueeze(1)
+        in_rec_mask = (orig_knn_expanded == rec_knn_expanded).any(dim=2).float()
+        not_in_rec_mask = 1.0 - in_rec_mask
+
+        c_sum = (torch.relu(closer_counts - (n_neighbors - 1)) * not_in_rec_mask).sum()
 
         denom = n_sample * n_neighbors * (2 * n_sample - 3 * n_neighbors - 1)
         C = 1.0 - (2.0 / denom) * c_sum if denom > 0 else 1.0
-        return max(0.0, min(1.0, C))
+        return max(0.0, min(1.0, float(C)))
 
     def get_layerwise_lr_params(self, base_lr: float, decay_factor: float = 0.9) -> List[Dict]:
         """Generate per-layer learning rate configs for fine-tuning.
@@ -1136,9 +1205,10 @@ class TensorRingEmbedding(nn.Module):
     def batched_forward(self, indices: torch.Tensor, accum_steps: int = 4) -> torch.Tensor:
         """Forward pass split into micro-batches for memory efficiency.
 
-        Divides the batch into accum_steps micro-batches and concatenates
-        the embedding output before returning. This is useful when GPU
-        memory only fits a small batch.
+        Divides the batch into accum_steps micro-batches and writes results
+        directly into a pre-allocated output tensor to avoid holding all
+        micro-batch outputs in memory simultaneously. This reduces peak memory
+        usage compared to naive concatenation.
 
         Note: This accumulates the output (not gradients). Actual gradient
         accumulation (optimizer step every N batches) should be handled at
@@ -1149,21 +1219,39 @@ class TensorRingEmbedding(nn.Module):
             accum_steps: Number of micro-batches.
 
         Returns:
-            Concatenated embedding output over all micro-batches.
+            Embedding output of shape ``(*indices.shape, embedding_dim)``.
         """
-        B = indices.shape[0]
+        original_shape = indices.shape
+        flat = indices.view(-1)
+        B = flat.shape[0]
         micro_batch_size = max(1, B // accum_steps)
-        outputs = []
+
+        output = torch.empty(
+            B, self.embedding_dim,
+            device=indices.device,
+            dtype=self._dtype,
+        )
+
+        if self.training or not self._cache_valid:
+            emb_contraction = self._compute_emb_contraction()
+        else:
+            emb_contraction = self._emb_cache
+
+        from .contraction import ring_closure
 
         for i in range(accum_steps):
             start = i * micro_batch_size
             end = start + micro_batch_size if i < accum_steps - 1 else B
             if start >= B:
                 break
-            out = self.forward(indices[start:end])
-            outputs.append(out)
+            micro_indices = flat[start:end]
+            out = self._vocab_chain(micro_indices)
+            micro_out = ring_closure(out, emb_contraction)
+            if not torch.jit.is_tracing() and micro_out.shape[-1] != self.embedding_dim:
+                micro_out = micro_out[..., :self.embedding_dim]
+            output[start:end] = micro_out
 
-        return torch.cat(outputs, dim=0)
+        return output.view(*original_shape, self.embedding_dim)
 
     def reconstruct(self) -> torch.Tensor:
         tr_tensor = TRTensor(self.cores.vocab_cores, self.cores.emb_cores)
@@ -1194,13 +1282,15 @@ class TensorRingEmbedding(nn.Module):
         return self.vocab_size
 
     @classmethod
-    def from_compression_ratio(cls, vocab_size, embedding_dim, ratio, ring_components=4, **kwargs):
+    def from_compression_ratio(cls, vocab_size: int, embedding_dim: int, ratio: float,
+                               ring_components: int = 4, **kwargs) -> TensorRingEmbedding:
         target_params = (vocab_size * embedding_dim) / ratio
         return cls(vocab_size, embedding_dim, target_params=target_params,
                    ring_components=ring_components, **kwargs)
 
     @classmethod
-    def from_target_params(cls, vocab_size, embedding_dim, params, ring_components=4, **kwargs):
+    def from_target_params(cls, vocab_size: int, embedding_dim: int, params: int,
+                           ring_components: int = 4, **kwargs) -> TensorRingEmbedding:
         return cls(vocab_size, embedding_dim, target_params=params,
                    ring_components=ring_components, **kwargs)
 
@@ -1227,6 +1317,8 @@ class TensorRingEmbedding(nn.Module):
             TensorRingEmbedding initialized to approximate ``embedding_matrix``.
         """
         V, D = embedding_matrix.shape
+        if kwargs.pop('_skip_init', None) is not None:
+            logger.warning("_skip_init ignored in from_pretrained; use from_pretrained() directly")
         emb = cls(V, D, rank=rank, ring_components=ring_components,
                   init_method=init_method, _skip_init=True, **kwargs)
         emb.cores.initialize(init_method, embedding_matrix)
@@ -1241,6 +1333,9 @@ class TensorRingEmbedding(nn.Module):
         init_method: str = "svd",
         cache_dir: Optional[str] = None,
         target_compression: Optional[float] = None,
+        trust_remote_code: bool = False,
+        max_model_size_gb: float = 5.0,
+        download_timeout: int = 300,
         **kwargs,
     ):
         """Load a HuggingFace model and decompose its embeddings via TR.
@@ -1256,6 +1351,10 @@ class TensorRingEmbedding(nn.Module):
             init_method: ``"svd"`` or ``"tr_svd"``.
             cache_dir: HF cache directory.
             target_compression: Target compression ratio if rank not given.
+            trust_remote_code: Whether to allow execution of remote code from model repo.
+                              Default False for security: ``False``. Set True only for trusted models.
+            max_model_size_gb: Maximum model size in GB to prevent OOM.
+            download_timeout: Download timeout in seconds.
             **kwargs: Additional args passed to TensorRingEmbedding.
 
         Returns:
@@ -1264,7 +1363,13 @@ class TensorRingEmbedding(nn.Module):
         from ..loaders.loaders import load_from_transformers
         from ..models.registry import ModelRegistry as _MR
 
-        matrix = load_from_transformers(model_name, cache_dir=cache_dir)
+        matrix = load_from_transformers(
+            model_name,
+            cache_dir=cache_dir,
+            trust_remote_code=trust_remote_code,
+            max_model_size_gb=max_model_size_gb,
+            download_timeout=download_timeout,
+        )
         V, D = matrix.shape
 
         if rank is None:
@@ -1487,7 +1592,13 @@ class TensorRingEmbedding(nn.Module):
                 next_core = all_cores[idx].data
                 curr = torch.einsum("...sa, dax -> ...dsx", curr, next_core)
             
-            S = torch.linalg.svdvals(curr.reshape(-1, curr.shape[-1] * curr.shape[-2]))
+            unfolded = curr.reshape(-1, curr.shape[-1] * curr.shape[-2])
+            m, n = unfolded.shape
+            if min(m, n) > 200:
+                q = min(min(m, n), 200)
+                _, S, _ = torch.svd_lowrank(unfolded.to(torch.float32), q=q)
+            else:
+                S = torch.linalg.svdvals(unfolded.to(torch.float32))
             
             k = 0
             for sigma in S:
@@ -1503,7 +1614,8 @@ class TensorRingEmbedding(nn.Module):
         if new_ranks != current_ranks:
             logger.info(f"Truncating ranks: {current_ranks} -> {new_ranks}")
             self.structure.ranks = new_ranks
-            matrix = self.reconstruct()
+            self._rank = max(new_ranks[:-1])
+            matrix = self.reconstruct().detach()
             self.cores = TensorRingCores(
                 self.structure, self.init_method, self.gauge_fix, self.gauge_fix_interval,
                 self._dtype, self.cores.vocab_cores[0].device, self.cores.spectral_reg_coeff
@@ -1528,11 +1640,281 @@ class TensorRingEmbedding(nn.Module):
                 p.grad.data.mul_(scale)
 
     def __repr__(self) -> str:
+        r = self._rank if self._rank is not None else max(self.structure.ranks)
         return (
             f"TensorRingEmbedding(V={self.vocab_size}, D={self.embedding_dim}, "
-            f"rank={self._rank}, comp={self.compression_ratio:.1f}x, "
+            f"rank={r}, comp={self.compression_ratio:.1f}x, "
             f"params={self.num_parameters:,})"
         )
+
+    def tie_weights(self, linear_layer: nn.Linear) -> nn.Module:
+        """Replace a linear layer's weight with a TR-based tied embedding projection.
+
+        For models with tied input/output embeddings (e.g., tied ``lm_head``),
+        this reuses the TR cores to compute the output logits projection without
+        materializing the full V×D matrix.
+
+        Args:
+            linear_layer: An ``nn.Linear(embedding_dim, vocab_size)`` layer
+                         (typically ``lm_head``).
+
+        Returns:
+            The wrapped ``nn.Linear`` with weight tied to ``self``.
+        """
+        if linear_layer.in_features != self.embedding_dim or linear_layer.out_features != self.vocab_size:
+            raise ValueError(
+                f"Linear layer shape ({linear_layer.out_features}, {linear_layer.in_features}) "
+                f"does not match (vocab_size={self.vocab_size}, embedding_dim={self.embedding_dim})"
+            )
+
+        class _TiedLinear(nn.Module):
+            def __init__(self, tr_emb):
+                super().__init__()
+                self.tr_emb = tr_emb
+                self.bias = nn.Parameter(torch.zeros(tr_emb.vocab_size))
+                # Cache the (V, D) tied projection matrix so we don't
+                # re-contract the entire vocab on every forward when cores
+                # haven't changed (the common case at inference).
+                self._cache_E = None
+                self._cache_signature = None
+
+            def _build_E(self, requires_grad: bool):
+                tr_emb = self.tr_emb
+                tr_emb_cores = list(tr_emb.cores.vocab_cores)
+                emb_cores = list(tr_emb.cores.emb_cores)
+                from .contraction import (
+                    compute_emb_precontraction,
+                    gather_vocab_cores,
+                    ring_closure,
+                )
+                emb_cont = compute_emb_precontraction(emb_cores)
+                strides = tr_emb._vocab_strides
+                factor_sizes = tr_emb.structure.vocab_factor_sizes
+                V = tr_emb.vocab_size
+                device = next(iter(tr_emb_cores)).device
+                all_v_idx = torch.arange(V, device=device, dtype=torch.long)
+                if not requires_grad:
+                    with torch.no_grad():
+                        voc_chain = gather_vocab_cores(
+                            all_v_idx, tr_emb_cores, factor_sizes,
+                            strides=strides,
+                        )
+                        return ring_closure(
+                            voc_chain.view(
+                                V, voc_chain.shape[1], voc_chain.shape[2]
+                            ),
+                            emb_cont,
+                        )
+                voc_chain = gather_vocab_cores(
+                    all_v_idx, tr_emb_cores, factor_sizes, strides=strides,
+                )
+                return ring_closure(
+                    voc_chain.view(V, voc_chain.shape[1], voc_chain.shape[2]),
+                    emb_cont,
+                )
+
+            def _get_E(self, training: bool, any_param_requires_grad: bool):
+                # We only cache when grads are NOT required to flow through
+                # the tied projection (i.e., at inference, or when training
+                # but the source embedding has been frozen). Caching breaks
+                # the autograd graph, which would silently zero grads on
+                # the embedding cores during a training step.
+                tr_emb = self.tr_emb
+                grad_path = training and any_param_requires_grad
+                sig = (
+                    id(tr_emb.cores),
+                    tuple(c._version for c in tr_emb.cores.vocab_cores),
+                    tuple(c._version for c in tr_emb.cores.emb_cores),
+                    next(iter(tr_emb.cores.vocab_cores)).device,
+                )
+                if grad_path or self._cache_E is None or self._cache_signature != sig:
+                    E = self._build_E(requires_grad=grad_path)
+                    if not grad_path and (self._cache_E is None or self._cache_signature != sig):
+                        self._cache_E = E
+                        self._cache_signature = sig
+                    return E
+                return self._cache_E
+
+            def forward(self, x):
+                tr_emb = self.tr_emb
+                any_param_rg = any(p.requires_grad for p in tr_emb.parameters())
+                E = self._get_E(self.training, any_param_rg)  # (V, D)
+                logits = x @ E.t()
+                return logits + self.bias
+
+        wrapped = _TiedLinear(self)
+        return wrapped
+
+    def distill(self, teacher_matrix: torch.Tensor, steps: int = 1000,
+                lr: float = 0.01, batch_size: int = 16384,
+                temperature: float = 2.0, alpha: float = 0.5,
+                verbose: bool = True) -> Dict[str, float]:
+        """Distill knowledge from a dense teacher embedding into this TR embedding.
+
+        Uses a hybrid loss combining:
+        - MSE loss between teacher and student outputs (hard targets)
+        - KL divergence between teacher and student output distributions (soft targets)
+
+        Args:
+            teacher_matrix: (V, D) dense teacher embedding matrix.
+            steps: Number of distillation steps.
+            lr: Peak learning rate.
+            batch_size: Total tokens per step.
+            temperature: Softmax temperature for KL divergence.
+            alpha: Weight for soft target loss (0 = MSE only, 1 = KL only).
+            verbose: Print progress.
+
+        Returns:
+            Dict with ``"final_loss"`` and ``"mse"``.
+        """
+        from .contraction import compute_emb_precontraction, ring_closure
+        from .factorization import compute_mixed_radix_strides
+
+        V, D = teacher_matrix.shape
+        teacher_matrix = teacher_matrix.to(dtype=self._dtype)
+        strides = compute_mixed_radix_strides(self.structure.vocab_factor_sizes)
+
+        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=1e-5)
+        if steps >= 20:
+            scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                optimizer, max_lr=lr, total_steps=steps,
+                pct_start=0.1, anneal_strategy='cos',
+            )
+        else:
+            scheduler = None
+
+        best_loss = float('inf')
+        final_mse = 0.0
+
+        for step in range(steps):
+            optimizer.zero_grad()
+            idx = torch.randint(0, V, (max(1, batch_size // D),), device=teacher_matrix.device)
+            student_out = self._vocab_chain(idx)
+            emb_cont = compute_emb_precontraction(list(self.cores.emb_cores))
+            student_out = ring_closure(student_out, emb_cont)
+
+            teacher_out = teacher_matrix[idx]
+
+            mse_loss = torch.nn.functional.mse_loss(student_out, teacher_out)
+
+            if alpha > 0:
+                student_logits = student_out / temperature
+                teacher_logits = teacher_out / temperature
+                kl_loss = torch.nn.functional.kl_div(
+                    torch.nn.functional.log_softmax(student_logits, dim=-1),
+                    torch.nn.functional.softmax(teacher_logits, dim=-1),
+                    reduction='batchmean',
+                ) * (temperature ** 2)
+                loss = (1 - alpha) * mse_loss + alpha * kl_loss
+            else:
+                loss = mse_loss
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.parameters(), 2.0)
+            optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
+
+            if loss.item() < best_loss:
+                best_loss = loss.item()
+                final_mse = mse_loss.item()
+
+        if verbose:
+            logger.info(f"Distillation done: final_loss={best_loss:.6f}, mse={final_mse:.6f}")
+
+        return {"final_loss": best_loss, "mse": final_mse}
+
+    def adjust_rank(self, new_rank: int) -> int:
+        """Adjust TR rank, warm-starting from current cores.
+
+        If new_rank > current rank, pads cores with small random values.
+        If new_rank < current rank, uses SVD-based truncation.
+
+        Args:
+            new_rank: Target rank (must be >= 2).
+
+        Returns:
+            Number of parameters added (positive) or removed (negative).
+        """
+        if new_rank < 2:
+            raise ValueError(f"new_rank must be >= 2, got {new_rank}")
+
+        old_params = self.num_parameters
+        current_ranks = list(self.structure.ranks)
+        current_rank = self._rank
+
+        if new_rank == current_rank:
+            return 0
+
+        core_list = list(self.cores.vocab_cores) + list(self.cores.emb_cores)
+        device = core_list[0].device
+        dtype = core_list[0].dtype
+
+        if new_rank > current_rank:
+            with torch.no_grad():
+                for core in core_list:
+                    old_shape = core.shape
+                    new_shape = list(old_shape)
+                    for dim_idx in [1, 2]:
+                        if old_shape[dim_idx] == current_rank:
+                            new_shape[dim_idx] = new_rank
+                    new_core = torch.zeros(new_shape, device=device, dtype=dtype)
+                    new_core[:old_shape[0], :old_shape[1], :old_shape[2]] = core.data
+                    for dim_idx in [1, 2]:
+                        if old_shape[dim_idx] == current_rank and new_shape[dim_idx] > old_shape[dim_idx]:
+                            sl = [slice(None)] * 3
+                            sl[dim_idx] = slice(old_shape[dim_idx], new_shape[dim_idx])
+                            noise_shape = list(new_shape)
+                            noise_shape[dim_idx] = new_shape[dim_idx] - old_shape[dim_idx]
+                            noise = torch.randn(noise_shape, device=device, dtype=dtype).mul_(0.01)
+                            new_core[tuple(sl)] = noise
+                    core.data = new_core
+            ranks_updated = [new_rank] * len(current_ranks)
+            self.structure.ranks = ranks_updated
+            self._rank = new_rank
+        else:
+            target_ranks = [new_rank] * len(current_ranks)
+            target_ranks[-1] = target_ranks[0]
+            self.structure.ranks = target_ranks
+            self._rank = new_rank
+            matrix = self.reconstruct().detach()
+            self.cores = TensorRingCores(
+                self.structure, self.init_method, self.gauge_fix, self.gauge_fix_interval,
+                self._dtype, device, self.cores.spectral_reg_coeff,
+            )
+            self.cores.initialize("svd", matrix)
+
+        self.cores._cached_param_count = None
+        self._vocab_strides = self._compute_strides(self.structure.vocab_factor_sizes)
+        self._cache_valid = False
+        self._emb_cache = None
+
+        return self.num_parameters - old_params
+
+    def to_onnx_runtime(self, path: str, batch_size: int = 1, seq_len: int = 128) -> Optional[object]:
+        """Export to ONNX and return an ONNX Runtime InferenceSession.
+
+        Requires ``onnxruntime`` to be installed.
+
+        Args:
+            path: Output path for the .onnx file.
+            batch_size: Batch size for export.
+            seq_len: Sequence length for export.
+
+        Returns:
+            ``onnxruntime.InferenceSession`` if onnxruntime is available, else None.
+
+        Raises:
+            ImportError: If onnxruntime is not installed.
+        """
+        onnx_path = self.export(path, format=ExportFormat.ONNX, batch_size=batch_size, seq_len=seq_len)
+        try:
+            import onnxruntime as ort
+        except ImportError:
+            raise ImportError(
+                "onnxruntime not found. Install with: pip install onnxruntime"
+            )
+        return ort.InferenceSession(onnx_path)
 
 
 class TensorRingDDP(nn.Module):
@@ -1658,7 +2040,7 @@ class ZipfHybridTensorRingEmbedding(nn.Module):
         spectral_reg_coeff: float = 0.0,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = torch.float32,
-        validate_indices: bool = True,
+        validate_indices: bool = False,
         auto_pad: bool = True,
         max_padding_pct: float = 0.15,
     ):

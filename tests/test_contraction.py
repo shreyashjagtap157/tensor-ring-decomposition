@@ -6,7 +6,6 @@ import pytest
 from tensor_ring_decomposition.core.contraction import (
     compute_emb_precontraction,
     ring_closure,
-    ContractionPathCache,
 )
 
 
@@ -63,31 +62,3 @@ class TestRingClosure:
         assert vocab_result.grad is not None
         assert emb_contraction.grad is not None
 
-
-class TestContractionPathCache:
-    def test_cache_hit(self):
-        ContractionPathCache.clear()
-        eq = "bm,bn->bmn"
-        t1 = torch.randn(2, 3)
-        t2 = torch.randn(2, 4)
-        path1, _ = ContractionPathCache.get_path(eq, [t1, t2])
-        path2, _ = ContractionPathCache.get_path(eq, [t1, t2])
-        assert path1 == path2
-
-    def test_cache_clear(self):
-        ContractionPathCache.clear()
-        eq = "bm,bn->bmn"
-        t1 = torch.randn(2, 3)
-        t2 = torch.randn(2, 4)
-        ContractionPathCache.get_path(eq, [t1, t2])
-        ContractionPathCache.clear()
-        path, _ = ContractionPathCache.get_path(eq, [t1, t2])
-        assert path is not None
-
-    def test_3d_contraction(self):
-        ContractionPathCache.clear()
-        eq = "bri,idr->bd"
-        t1 = torch.randn(4, 3, 3)
-        t2 = torch.randn(3, 8, 3)
-        path, _ = ContractionPathCache.get_path(eq, [t1, t2])
-        assert path is not None

@@ -1215,3 +1215,27 @@ class TestDiverseEmbeddings:
         
         error = emb.distribution_aware_reconstruction_error(matrix, input_probs=probs)
         assert error < 1.0
+
+
+# ── Test 42: Factory methods ────────────────────────────────────
+
+class TestFactoryMethods:
+    def test_from_compression_ratio(self):
+        emb = TensorRingEmbedding.from_compression_ratio(5000, 128, 10.0)
+        assert emb.vocab_size == 5000
+        assert emb.embedding_dim == 128
+        assert emb.compression_ratio >= 9.0
+
+    def test_from_target_params(self):
+        emb = TensorRingEmbedding.from_target_params(5000, 128, 50000)
+        assert emb.vocab_size == 5000
+        assert emb.embedding_dim == 128
+        assert emb.num_parameters <= 50000
+
+    def test_minimum_dimension(self):
+        # Smallest possible: vocab_size == ring_components
+        emb = TensorRingEmbedding(2, 2, rank=2, ring_components=2)
+        indices = torch.tensor([0, 1])
+        out = emb(indices)
+        assert out.shape == (2, 2)
+        assert not torch.isnan(out).any()

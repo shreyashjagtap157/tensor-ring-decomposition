@@ -2,15 +2,9 @@
 
 import pytest
 
-from tensor_ring_decomposition.core.contraction import ContractionPathCache
+
 from tensor_ring_decomposition.models.registry import ModelRegistry
 from tensor_ring_decomposition.models.profiles import BUILTIN_PROFILES
-
-
-@pytest.fixture(autouse=True)
-def _clear_contraction_cache():
-    """Clear the global contraction path cache before each test."""
-    ContractionPathCache.clear()
 
 
 @pytest.fixture(autouse=True)

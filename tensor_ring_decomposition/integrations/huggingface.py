@@ -53,7 +53,7 @@ class HuggingFaceTensorRingEmbedding:
     ) -> "PreTrainedModel":
         """Replace input embedding layers with TensorRingEmbedding.
 
-        Only replaces the model's input embedding (and tied lm_head if applicable),
+        Only replaces the model's word/input embedding,
         not position embeddings, token type embeddings, or other nn.Embedding layers.
         Validates compatibility before replacement.
         """
@@ -63,29 +63,28 @@ class HuggingFaceTensorRingEmbedding:
         if input_emb is None:
             raise ValueError(f"Model {type(model).__name__} has no input embedding")
 
+        skip_patterns = ("position", "token_type", "segment")
+
         replaced_names = []
         for name, module in model.named_modules():
-            if module is input_emb:
-                parent_name = ".".join(name.split(".")[:-1])
-                child_name = name.split(".")[-1]
-                if parent_name:
-                    parent = dict(model.named_modules())[parent_name]
-                else:
-                    parent = model
-                setattr(parent, child_name, tr_embedding)
-                replaced_names.append(name)
+            if module is not input_emb:
+                continue
+            if any(p in name.lower() for p in skip_patterns):
+                continue
+            parent_name = ".".join(name.split(".")[:-1])
+            child_name = name.split(".")[-1]
+            if parent_name:
+                parent = dict(model.named_modules())[parent_name]
+            else:
+                parent = model
+            setattr(parent, child_name, tr_embedding)
+            replaced_names.append(name)
 
         if not replaced_names:
             raise ValueError(
                 f"Could not find input embedding layer in model {type(model).__name__}"
             )
 
-        # Note: lm_head tied embedding weights are NOT replaced here.
-        # Replacing lm_head.weight with tr_embedding.weight would materialize
-        # the full V×D dense matrix, defeating compression. The model's output
-        # probabilities after replacement will be computed using the TR embedding's
-        # forward path through the linear head. For full tied-weight behavior,
-        # consider wrapping lm_head in a custom module that uses tr_embedding.
         if hasattr(model.config, "tie_word_embeddings") and model.config.tie_word_embeddings:
             logger.warning(
                 "Model has tied word embeddings. The input embedding has been replaced "

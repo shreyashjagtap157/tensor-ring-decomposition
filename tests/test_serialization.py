@@ -85,3 +85,19 @@ class TestSerialization:
             manifest_path = Path(path).with_suffix(".json")
             manifest = json.loads(manifest_path.read_text())
             assert manifest["author"] == "test"
+
+    def test_explicit_ranks_roundtrip(self):
+        """Verify serialization roundtrip with explicit ranks (not scalar rank)."""
+        emb = TensorRingEmbedding(100, 32, rank=None, ranks=[4, 8, 8, 8, 4])
+        indices = torch.tensor([0, 1, 2])
+        original_output = emb(indices)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "test_ranks_model")
+            save(emb, path)
+
+            loaded = load(path)
+            loaded_output = loaded(indices)
+
+            assert loaded.structure.ranks == [4, 8, 8, 8, 4]
+            assert torch.allclose(original_output, loaded_output, atol=1e-6)

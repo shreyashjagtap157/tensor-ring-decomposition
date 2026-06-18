@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.0 (unreleased)
+
+### Fixes
+- `replace_in_model()`: added skip patterns for position/token-type/segment embeddings
+- `trustworthiness()` / `continuity()`: fixed cross-space distance comparison and 1-indexed rank normalization
+- `truncate_ranks()`: use `torch.svd_lowrank` for large matrices
+- `load_from_transformers()`: attempt embedding-only download before loading full model
+- `distribution_aware_reconstruction_error_v2()`: refactored into 4 helper methods (reduced nesting depth)
+- `_train_to_matrix()` / `_sample_reconstruct()`: deduplicated forward logic via `_compute_forward()`
+- `NonNegativeClamp.backward`: removed wasteful `.clone()` (already applied in prior audit)
+
+### New Features
+- `tie_weights(linear_layer)`: weight tying for tied input/output embeddings
+- `distill(teacher_matrix, ...)`: knowledge distillation from dense teacher to TR student
+- `adjust_rank(new_rank)`: progressive rank adjustment with warm-start (pad or truncate)
+- `to_onnx_runtime(path)`: export to ONNX and return ONNX Runtime InferenceSession
+- Added `.hf_cache/` to `.gitignore`
+
+### Housekeeping
+- Removed unused `_emb_strides` dead storage from both embeddings
+- Removed dead `spectral_gap` local-search loop
+- Version bump to 0.4.0
+
 ## 0.3.0 (released)
 
 ### Enterprise Features

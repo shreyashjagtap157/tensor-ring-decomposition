@@ -9,7 +9,7 @@ Enterprise-grade quantization:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -89,7 +89,11 @@ def _quantize_tensor(t: torch.Tensor) -> Tuple[torch.Tensor, float, int]:
 
 def _quantize_tensor_per_channel(t: torch.Tensor, dim: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Quantize a float tensor to int8 with per-channel scales."""
-    abs_max = t.abs().amax(dim=tuple(range(1, t.ndim)) if t.ndim > 1 else (1,))
+    reduce_dims = tuple(d for d in range(t.ndim) if d != dim)
+    if reduce_dims:
+        abs_max = t.abs().amax(dim=reduce_dims)
+    else:
+        abs_max = t.abs()
     abs_max = abs_max.clamp(min=1e-8)
     scales = abs_max / 127.0
     q = (t / scales.view(-1, *([1] * (t.ndim - 1)))).round().clamp(-128, 127).to(torch.int8)
@@ -231,6 +235,23 @@ class QuantizedTensorRingEmbedding(nn.Module):
             q_cores.append(q); scales.append(s); zeros.append(z)
         return q_cores, scales, zeros
 
+    def _ste_quantize_core(self, core: torch.Tensor) -> torch.Tensor:
+        """Quantize a single core using STE with per-channel or per-tensor scale."""
+        if not self._per_channel:
+            scale = core.data.abs().max() / 127.0
+            return STERound.apply(core / scale).clamp(-128, 127) * scale
+        scale = core.data.abs().amax(dim=tuple(range(1, core.data.ndim))) / 127.0
+        return STERound.apply(core / scale.view(-1, 1, 1)).clamp(-128, 127) * scale.view(-1, 1, 1)
+
+    def _gather_and_chain(self, vocab_cores_q: List[torch.Tensor],
+                          factor_indices: List[torch.Tensor]) -> torch.Tensor:
+        """Gather quantized vocab cores and chain via bmm."""
+        gathered = [vocab_cores_q[i][factor_indices[i]] for i in range(len(vocab_cores_q))]
+        result = gathered[0]
+        for cg in gathered[1:]:
+            result = torch.bmm(result, cg)
+        return result
+
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if not self._quantized:
             raise RuntimeError("Must call quantize() before forward")
@@ -249,61 +270,33 @@ class QuantizedTensorRingEmbedding(nn.Module):
             emb_cores_list = self.tr_embedding.cores.emb_cores
 
             if self.lsq and self._lsq_initialized:
-                gathered = []
-                for i, core in enumerate(vocab_cores):
-                    if self._per_channel:
-                        core_q = self._lsq_quantize_core(core, self._vocab_lsq_scales[i])
-                    else:
-                        core_q = self._lsq_quantize_core(core, self._vocab_lsq_scales[i])
-                    gathered.append(core_q[factor_indices[i]])
-
-                result = gathered[0]
-                for cg in gathered[1:]:
-                    result = torch.bmm(result, cg)
-
-                q_emb_cores = []
-                for i, core in enumerate(emb_cores_list):
-                    core_q = self._lsq_quantize_core(core, self._emb_lsq_scales[i])
-                    q_emb_cores.append(core_q)
+                vocab_q = [self._lsq_quantize_core(c, self._vocab_lsq_scales[i])
+                           for i, c in enumerate(vocab_cores)]
+                result = self._gather_and_chain(vocab_q, factor_indices)
+                q_emb_cores = [self._lsq_quantize_core(c, self._emb_lsq_scales[i])
+                               for i, c in enumerate(emb_cores_list)]
             else:
-                gathered = []
-                for i, core in enumerate(vocab_cores):
-                    if not self._per_channel:
-                        scale = core.data.abs().max() / 127.0
-                        core_q = STERound.apply(core / scale).clamp(-128, 127) * scale
-                    else:
-                        scale = core.data.abs().amax(dim=tuple(range(1, core.data.ndim))) / 127.0
-                        core_q = STERound.apply(core / scale.view(-1, 1, 1)).clamp(-128, 127) * scale.view(-1, 1, 1)
-                    gathered.append(core_q[factor_indices[i]])
-
-                result = gathered[0]
-                for cg in gathered[1:]:
-                    result = torch.bmm(result, cg)
-
-                q_emb_cores = []
-                for core in emb_cores_list:
-                    if not self._per_channel:
-                        scale = core.data.abs().max() / 127.0
-                        core_q = STERound.apply(core / scale).clamp(-128, 127) * scale
-                    else:
-                        scale = core.data.abs().amax(dim=tuple(range(1, core.data.ndim))) / 127.0
-                        core_q = STERound.apply(core / scale.view(-1, 1, 1)).clamp(-128, 127) * scale.view(-1, 1, 1)
-                    q_emb_cores.append(core_q)
+                vocab_q = [self._ste_quantize_core(c) for c in vocab_cores]
+                result = self._gather_and_chain(vocab_q, factor_indices)
+                q_emb_cores = [self._ste_quantize_core(c) for c in emb_cores_list]
 
             from ..core.contraction import compute_emb_precontraction
             emb = compute_emb_precontraction(q_emb_cores)
         else:
-            gathered = []
-            for i, qcore in enumerate(self._q_vocab_cores):
-                scale = self._vocab_scales[i]
-                gathered_q = qcore[factor_indices[i]].float()
-                if isinstance(scale, torch.Tensor) and scale.ndim > 0:
-                    gathered.append(gathered_q * scale[factor_indices[i]].view(-1, 1, 1))
+            result = self._q_vocab_cores[0][factor_indices[0]].float()
+            s0 = self._vocab_scales[0]
+            if isinstance(s0, torch.Tensor) and s0.ndim > 0:
+                result = result * s0[factor_indices[0]].view(-1, 1, 1)
+            else:
+                result = result * s0
+            for i in range(1, len(self._q_vocab_cores)):
+                g = self._q_vocab_cores[i][factor_indices[i]].float()
+                s = self._vocab_scales[i]
+                if isinstance(s, torch.Tensor) and s.ndim > 0:
+                    g = g * s[factor_indices[i]].view(-1, 1, 1)
                 else:
-                    gathered.append(gathered_q * scale)
-            result = gathered[0]
-            for cg in gathered[1:]:
-                result = torch.bmm(result, cg)
+                    g = g * s
+                result = torch.bmm(result, g)
 
             if not self.training and self._cache_valid:
                 emb = self._emb_cache

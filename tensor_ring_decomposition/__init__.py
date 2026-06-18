@@ -51,4 +51,8 @@ __all__ = [
     "TensorRingCallback",
 ]
 
-__version__ = "0.3.0"
+try:
+    from importlib.metadata import version as _v
+    __version__ = _v("tensor-ring-decomposition")
+except Exception:
+    __version__ = "0.4.0"

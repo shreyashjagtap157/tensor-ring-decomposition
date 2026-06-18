@@ -123,6 +123,11 @@ def compress(
         )
     elif profile is not None:
         # Profile only: must use random init
+        if init_method in ("svd", "tr_svd", "als", "distribution_aware"):
+            logger.info(
+                f"Matrix not available for '{source}'; using uniform init instead of {init_method}. "
+                f"Pass a tensor or use from_huggingface for matrix-based init."
+            )
         actual_init = init_method if init_method not in ("svd", "tr_svd", "als", "distribution_aware") else "uniform"
         emb = TensorRingEmbedding.from_profile(
             profile, rank=rank, target_compression=target_compression,

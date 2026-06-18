@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 import math
 import time
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
@@ -179,38 +179,31 @@ class TensorRingCores(nn.Module):
         # Crop to original dimensions to handle padding
         return result[:self.structure.original_vocab_size, :self.structure.original_embedding_dim]
 
+    def _compute_forward(self, indices: torch.Tensor, strides=None) -> torch.Tensor:
+        """Core forward computation: vocab chain + emb precontraction + ring closure.
+        
+        Shared by ``_sample_reconstruct`` and ``_train_to_matrix``
+        to avoid duplicating the contraction logic.
+        """
+        from .contraction import gather_vocab_cores, compute_emb_precontraction, ring_closure
+
+        vf = self.structure.vocab_factor_sizes
+        if strides is None:
+            strides = compute_mixed_radix_strides(vf)
+        flat = indices.reshape(-1)
+        result = gather_vocab_cores(flat, list(self.vocab_cores), vf, strides=strides)
+        emb = compute_emb_precontraction(list(self.emb_cores))
+        output = ring_closure(result, emb)
+        D = self.structure.original_embedding_dim
+        return output[..., :D].reshape(-1, D)
+
     def _sample_reconstruct(self, indices: torch.Tensor) -> torch.Tensor:
         """Reconstruct TR output for specific row indices only.
 
         Avoids materializing the full V×D matrix. Useful for sampled
         error computation during ALS sweeps.
         """
-        from .contraction import compute_emb_precontraction, ring_closure
-        from .factorization import compute_mixed_radix_strides
-
-        k = self.structure.n_vocab_cores
-        vf = self.structure.vocab_factor_sizes
-        strides = compute_mixed_radix_strides(vf)
-
-        flat = indices.reshape(-1)
-        factor_indices: List[torch.Tensor] = []
-        remaining = flat
-        for i in range(k):
-            if i < k - 1:
-                fi = remaining // strides[i]
-                remaining = remaining % strides[i]
-            else:
-                fi = remaining
-            factor_indices.append(fi.clamp(0, vf[i] - 1))
-
-        gathered = [core[factor_indices[i]] for i, core in enumerate(self.vocab_cores)]
-        result = gathered[0]
-        for cg in gathered[1:]:
-            result = torch.bmm(result, cg)
-
-        emb = compute_emb_precontraction(list(self.emb_cores))
-        output = ring_closure(result, emb)
-        return output[..., :self.structure.original_embedding_dim].reshape(-1, self.structure.original_embedding_dim)
+        return self._compute_forward(indices)
 
     def _init_svd(self, matrix: torch.Tensor, steps: int = 1000) -> None:
         """Initialize via sampled batch training to approximate target matrix.
@@ -241,38 +234,17 @@ class TensorRingCores(nn.Module):
             batch_size: Total tokens per step.
             input_probs: Optional (V,) token probabilities for weighted loss.
         """
-        from .contraction import compute_emb_precontraction, ring_closure
-
         V, D = target.shape
-        k = self.structure.n_vocab_cores
-        vf = self.structure.vocab_factor_sizes
         use_distribution_aware = input_probs is not None
 
         if use_distribution_aware:
             input_probs = input_probs / input_probs.sum()
             sqrt_probs = input_probs.sqrt()
 
-        strides = compute_mixed_radix_strides(vf)
+        strides = compute_mixed_radix_strides(self.structure.vocab_factor_sizes)
 
         def forward_fn(indices: torch.Tensor) -> torch.Tensor:
-            flat = indices.reshape(-1)
-            factor_indices = []
-            remaining = flat
-            for i in range(k):
-                if i < k - 1:
-                    fi = remaining // strides[i]
-                    remaining = remaining % strides[i]
-                else:
-                    fi = remaining
-                factor_indices.append(fi.clamp(0, vf[i] - 1))
-            gathered = [core[factor_indices[i]] for i, core in enumerate(self.vocab_cores)]
-            result = gathered[0]
-            for cg in gathered[1:]:
-                result = torch.bmm(result, cg)
-            emb_cont = compute_emb_precontraction(list(self.emb_cores))
-            output = ring_closure(result, emb_cont)
-            # Crop to original embedding dimension
-            return output[..., :D].reshape(-1, D)
+            return self._compute_forward(indices, strides=strides)
 
         def compute_loss(pred: torch.Tensor, tgt: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
             diff = pred - tgt
@@ -376,8 +348,7 @@ class TensorRingCores(nn.Module):
         core sequentially. Converges much faster than SGD.
         
         Uses Tikhonov regularization (ridge regression) to prevent overfitting
-        from ill-conditioned linear systems. Caches Gram matrices across sweeps
-        when possible.
+        from ill-conditioned linear systems.
         
         Args:
             target: (V, D) target embedding matrix.
@@ -394,8 +365,18 @@ class TensorRingCores(nn.Module):
         V, D = target.shape
         
         if pV != V or pD != D:
-            padded_target = torch.zeros((pV, pD), device=target.device, dtype=target.dtype)
-            padded_target[:V, :D] = target
+            # Memory guard: skip padding if the padded matrix exceeds ~1.5 GB
+            padded_bytes = pV * pD * target.element_size()
+            if padded_bytes > 1.5e9:
+                logger.warning(
+                    f"ALS: padded matrix {pV}×{pD} ({padded_bytes/1e9:.1f} GB) exceeds 1.5 GB. "
+                    f"Skipping padding — ALS will use the unpadded target with slightly "
+                    f"reduced accuracy."
+                )
+                padded_target = target
+            else:
+                padded_target = torch.zeros((pV, pD), device=target.device, dtype=target.dtype)
+                padded_target[:V, :D] = target
         else:
             padded_target = target
 
@@ -437,7 +418,7 @@ class TensorRingCores(nn.Module):
                 Gram = X @ X.T
                 if lambda_reg > 0:
                     Gram = Gram + lambda_reg * torch.eye(rr, device=X.device, dtype=X.dtype)
-                G_flat = torch.linalg.solve(Gram, X @ W_mat.T).T
+                G_flat = torch.linalg.lstsq(Gram, X @ W_mat.T).solution.T
                 G = G_flat.reshape(dims[j], ranks[j], ranks[j+1])
                 
                 # Update the core

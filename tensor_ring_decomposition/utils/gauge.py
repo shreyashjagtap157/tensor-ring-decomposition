@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List
 
 import torch
 import torch.nn as nn
@@ -120,5 +120,7 @@ def _power_iteration_svd(A: torch.Tensor, n_iter: int = 15) -> torch.Tensor:
             u = u / u_norm
         v = A.T @ u
 
+    # Normalize v before Rayleigh quotient to get σ (not σ²)
+    v = v / v.norm()
     sigma = (u * (A @ v)).sum().abs()
     return sigma

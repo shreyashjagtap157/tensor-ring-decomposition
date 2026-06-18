@@ -42,7 +42,7 @@ def save(
 
     # Serialize to bytes, write to disk, compute hash from same bytes
     weights_bytes = sf.save(weights)
-    weights_path = Path(path).with_suffix(".safetensors")
+    weights_path = Path(path).with_suffix("").with_suffix(".safetensors")
     weights_path.write_bytes(weights_bytes)
 
     if secret_key:
@@ -75,7 +75,7 @@ def save(
         manifest.update(extra_metadata)
 
     # Save manifest
-    manifest_path = Path(path).with_suffix(".json")
+    manifest_path = Path(path).with_suffix("").with_suffix(".json")
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
 
 
@@ -94,14 +94,14 @@ def load(
     from ..core.embedding import TensorRingEmbedding
 
     # Load manifest
-    manifest_path = Path(path).with_suffix(".json")
+    manifest_path = Path(path).with_suffix("").with_suffix(".json")
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
     manifest = json.loads(manifest_path.read_text())
 
     # Verify hash (single read of weights bytes)
-    weights_path = Path(path).parent / manifest["weights_file"]
+    weights_path = Path(path).with_suffix("").with_suffix(".safetensors")
     if not weights_path.exists():
         raise FileNotFoundError(f"Weights not found: {weights_path}")
 
@@ -125,19 +125,35 @@ def load(
 
     # Reconstruct embedding with full config roundtrip
     config = manifest["tr_config"]
-    embedding = TensorRingEmbedding(
-        vocab_size=config["vocab_size"],
-        embedding_dim=config["embedding_dim"],
-        rank=config["rank"] if config.get("rank") is not None else max(config.get("ranks", [4])),
-        ring_components=config.get("ring_components", 4),
-        split_mode=config.get("split_mode", "balanced"),
-        init_method="uniform",
-        gauge_fix=config.get("gauge_fix", "left"),
-        gauge_fix_interval=config.get("gauge_fix_interval", 1000),
-        padding_idx=config.get("padding_idx"),
-        max_seq_len=config.get("max_seq_len"),
-        spectral_reg_coeff=config.get("spectral_reg_coeff", 0.0),
-    )
+    if config.get("used_explicit_ranks") and config.get("structure_ranks"):
+        embedding = TensorRingEmbedding(
+            vocab_size=config["vocab_size"],
+            embedding_dim=config["embedding_dim"],
+            rank=None,
+            ranks=config["structure_ranks"],
+            ring_components=config.get("ring_components", 4),
+            split_mode=config.get("split_mode", "balanced"),
+            init_method="uniform",
+            gauge_fix=config.get("gauge_fix", "left"),
+            gauge_fix_interval=config.get("gauge_fix_interval", 1000),
+            padding_idx=config.get("padding_idx"),
+            max_seq_len=config.get("max_seq_len"),
+            spectral_reg_coeff=config.get("spectral_reg_coeff", 0.0),
+        )
+    else:
+        embedding = TensorRingEmbedding(
+            vocab_size=config["vocab_size"],
+            embedding_dim=config["embedding_dim"],
+            rank=config["rank"] if config.get("rank") is not None else max(config.get("ranks", [4])),
+            ring_components=config.get("ring_components", 4),
+            split_mode=config.get("split_mode", "balanced"),
+            init_method="uniform",
+            gauge_fix=config.get("gauge_fix", "left"),
+            gauge_fix_interval=config.get("gauge_fix_interval", 1000),
+            padding_idx=config.get("padding_idx"),
+            max_seq_len=config.get("max_seq_len"),
+            spectral_reg_coeff=config.get("spectral_reg_coeff", 0.0),
+        )
     embedding.load_state_dict(weights)
 
     return embedding
