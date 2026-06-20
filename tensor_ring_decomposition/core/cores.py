@@ -20,6 +20,11 @@ import torch.nn.functional as F
 
 from .factorization import RingStructure, compute_mixed_radix_strides
 from ..utils.gauge import GaugeFixer
+from ..utils.constants import (
+    DEFAULT_SVD_INIT_STEPS, DEFAULT_SVD_INIT_BATCH_SIZE,
+    DEFAULT_TR_SVD_STEPS, DEFAULT_TR_SVD_BATCH_SIZE,
+    DEFAULT_ALS_SAMPLE_SIZE, DEFAULT_ALS_PADDING_LIMIT_BYTES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +86,9 @@ class TensorRingCores(nn.Module):
         self._step = 0
         self._init_info: Dict[str, any] = {}
         self._cached_param_count: Optional[int] = None
+        self._emb_contraction_cache: Optional[torch.Tensor] = None
+        self._emb_contraction_valid: bool = False
+        self._randint_buffer: Optional[torch.Tensor] = None
 
     def initialize(
         self, init_method: str, embedding_matrix: Optional[torch.Tensor] = None,
@@ -145,8 +153,8 @@ class TensorRingCores(nn.Module):
         with ``_train_to_matrix(steps=0)`` (random init, no training).
         """
         self._init_xavier("uniform")
-        logger.info("fast_training: running 700-step refinement...")
-        self._train_to_matrix(matrix, steps=700, lr=0.02, batch_size=32768)
+        logger.info(f"fast_training: running {DEFAULT_SVD_INIT_STEPS}-step refinement...")
+        self._train_to_matrix(matrix, steps=DEFAULT_SVD_INIT_STEPS, lr=0.02, batch_size=DEFAULT_SVD_INIT_BATCH_SIZE)
 
         GaugeFixer.fix_left(self.vocab_cores)
         GaugeFixer.fix_right(self.emb_cores)
@@ -215,12 +223,12 @@ class TensorRingCores(nn.Module):
         """
         self._init_xavier("uniform")
         logger.info("Starting sampled batch training for from_pretrained init...")
-        self._train_to_matrix(matrix, steps=steps, lr=0.01, batch_size=16384)
+        self._train_to_matrix(matrix, steps=steps, lr=0.01, batch_size=DEFAULT_TR_SVD_BATCH_SIZE)
         logger.info("from_pretrained init complete.")
 
     def _train_to_matrix(
         self, target: torch.Tensor, steps: int = 1000, lr: float = 0.01,
-        batch_size: int = 16384, input_probs: Optional[torch.Tensor] = None,
+        batch_size: int = DEFAULT_TR_SVD_BATCH_SIZE, input_probs: Optional[torch.Tensor] = None,
         patience: int = 100, min_delta: float = 1e-6,
     ) -> None:
         """Train cores on sampled batches to approximate target embedding matrix.
@@ -238,7 +246,12 @@ class TensorRingCores(nn.Module):
         use_distribution_aware = input_probs is not None
 
         if use_distribution_aware:
-            input_probs = input_probs / input_probs.sum()
+            psum = input_probs.sum()
+            if psum == 0:
+                logger.warning("input_probs sum is zero; falling back to uniform distribution")
+                input_probs = torch.ones_like(input_probs) / input_probs.shape[0]
+            else:
+                input_probs = input_probs / psum
             sqrt_probs = input_probs.sqrt()
 
         strides = compute_mixed_radix_strides(self.structure.vocab_factor_sizes)
@@ -261,13 +274,17 @@ class TensorRingCores(nn.Module):
         )
 
         tokens_per_step = max(1, batch_size // D)
+        if self._randint_buffer is None or self._randint_buffer.shape[0] != tokens_per_step:
+            self._randint_buffer = torch.empty(tokens_per_step, dtype=torch.long, device=target.device)
+
         best_params = None
         best_loss = float('inf')
         no_improve_steps = 0
 
         for step in range(steps):
             optimizer.zero_grad()
-            idx = torch.randint(0, V, (tokens_per_step,), device=target.device)
+            torch.randint(0, V, (tokens_per_step,), out=self._randint_buffer)
+            idx = self._randint_buffer
             pred = forward_fn(idx)
             tgt = target[idx]
             loss = compute_loss(pred, tgt, idx)
@@ -275,6 +292,8 @@ class TensorRingCores(nn.Module):
             torch.nn.utils.clip_grad_norm_(self.parameters(), 2.0)
             optimizer.step()
             scheduler.step()
+            # Apply gauge fixing at configured interval during training
+            self._apply_gauge_fix()
 
             if loss.item() < best_loss - min_delta:
                 best_loss = loss.item()
@@ -323,9 +342,9 @@ class TensorRingCores(nn.Module):
         input_probs = input_probs / input_probs.sum()
         sqrt_probs = input_probs.sqrt()
 
-        logger.info("Distribution-aware init: running 500-step refinement...")
+        logger.info(f"Distribution-aware init: running {DEFAULT_SVD_INIT_STEPS}-step refinement...")
         self._train_to_matrix(
-            matrix, steps=500, lr=0.02, batch_size=32768,
+            matrix, steps=500, lr=0.02, batch_size=DEFAULT_SVD_INIT_BATCH_SIZE,
             input_probs=input_probs,
         )
 
@@ -340,8 +359,69 @@ class TensorRingCores(nn.Module):
 
         return weighted_error.item()
 
+    def _init_svd_warm_start(self, matrix: torch.Tensor, rank: Optional[int] = None) -> None:
+        """Initialize cores using SVD for ALS warm-start.
+        
+        Computes truncated SVD and uses the factor matrices to initialize
+        tensor ring cores. Uses Hadamard-based initialization for each core
+        combined with scaled SVD factors for a good starting point.
+        
+        Args:
+            matrix: (V, D) target embedding matrix.
+            rank: Truncation rank for SVD. Defaults to self.structure.rank.
+        """
+        if rank is None:
+            rank = self.structure.rank
+        
+        dtype = matrix.dtype
+        device = matrix.device
+        matrix_f = matrix.to(torch.float32)
+        
+        try:
+            U, S, Vt = torch.linalg.svd(matrix_f, full_matrices=False)
+            U = U[:, :rank]
+            S = S[:rank]
+            Vt = Vt[:rank, :]
+        except Exception:
+            logger.warning("SVD failed, falling back to Xavier init")
+            self._init_xavier("uniform")
+            return
+        
+        k = self.structure.n_vocab_cores
+        m = self.structure.n_emb_cores
+        vocab_factors = self.structure.vocab_factor_sizes
+        emb_factors = self.structure.emb_factor_sizes
+        ranks = self.structure.ranks
+        
+        try:
+            for i in range(k):
+                # Use U scaled by sqrt(S) for first core, random orthogonal for others
+                if i == 0:
+                    scale = S.sqrt().reshape(1, -1, 1) / S.max().sqrt()
+                    u_slice = U[:vocab_factors[i], :ranks[i + 1]]
+                    init_data = u_slice.unsqueeze(-1).expand(-1, -1, ranks[i + 1]) * scale
+                    self.vocab_cores[i].data.copy_(init_data.to(dtype).to(device))
+                else:
+                    nn.init.orthogonal_(self.vocab_cores[i].data)
+            
+            # Initialize emb cores using Vt.T (V) and S
+            V = Vt.T
+            for i in range(m):
+                if i == 0:
+                    scale = S.sqrt().reshape(1, -1, 1) / S.max().sqrt()
+                    v_slice = V[:emb_factors[i], :ranks[k + i + 1]]
+                    init_data = v_slice.unsqueeze(-1).expand(-1, -1, ranks[k + i + 1]) * scale
+                    self.emb_cores[i].data.copy_(init_data.to(dtype).to(device))
+                else:
+                    nn.init.orthogonal_(self.emb_cores[i].data)
+                    
+        except Exception as e:
+            logger.warning(f"SVD warm-start reshape failed: {e}, falling back to Xavier")
+            self._init_xavier("uniform")
+
     def _init_als(self, target: torch.Tensor, sweeps: int = 5,
-                  lambda_reg: float = 1e-5, tol: float = 1e-6) -> None:
+                  lambda_reg: float = 1e-5, tol: float = 1e-6,
+                  svd_warm_start: bool = True) -> None:
         """Initialize cores using Alternating Least Squares (ALS).
         
         SOTA fast fitting technique that solves the least-squares problem for each
@@ -356,6 +436,9 @@ class TensorRingCores(nn.Module):
             lambda_reg: Tikhonov regularization strength (default 1e-5).
             tol: Stopping tolerance on relative error improvement (default 1e-6).
                  If error improves less than tol between sweeps, stops early.
+            svd_warm_start: If True, initialize with SVD before ALS for faster
+                          convergence. SVD provides a good starting point that
+                          ALS can refine. Default True.
         """
         # Pad target matrix to match padded dimensions of the ring structure.
         # Padded entries are set to zero; the sampled error computation
@@ -367,7 +450,7 @@ class TensorRingCores(nn.Module):
         if pV != V or pD != D:
             # Memory guard: skip padding if the padded matrix exceeds ~1.5 GB
             padded_bytes = pV * pD * target.element_size()
-            if padded_bytes > 1.5e9:
+            if padded_bytes > DEFAULT_ALS_PADDING_LIMIT_BYTES:
                 logger.warning(
                     f"ALS: padded matrix {pV}×{pD} ({padded_bytes/1e9:.1f} GB) exceeds 1.5 GB. "
                     f"Skipping padding — ALS will use the unpadded target with slightly "
@@ -386,7 +469,13 @@ class TensorRingCores(nn.Module):
         
         # Reshape padded target to N-dimensional tensor
         W = padded_target.reshape(*dims)
-        self._init_xavier("uniform")
+        
+        # SVD warm-start: initialize with SVD for faster ALS convergence
+        if svd_warm_start:
+            self._init_svd_warm_start(target)
+            logger.info("ALS initialized with SVD warm-start")
+        else:
+            self._init_xavier("uniform")
         
         prev_error = float('inf')
         for sweep in range(sweeps):
@@ -427,8 +516,11 @@ class TensorRingCores(nn.Module):
                 else:
                     self.emb_cores[j - len(self.vocab_cores)].data.copy_(G)
             
+            # Apply gauge fixing before evaluating error
+            self._apply_gauge_fix()
+
             # Compute sampled error for the sweep (avoids full reconstruction)
-            n_sample = min(V, 1024)
+            n_sample = min(V, DEFAULT_ALS_SAMPLE_SIZE)
             sample_idx = torch.randperm(V)[:n_sample]
             with torch.no_grad():
                 target_sample = target[sample_idx]
@@ -501,6 +593,9 @@ class TensorRingCores(nn.Module):
             GaugeFixer.fix_right(self.vocab_cores)
             GaugeFixer.fix_right(self.emb_cores)
 
+        self._emb_contraction_valid = False
+        self._emb_contraction_cache = None
+
     def spectral_norms(self) -> Dict[str, float]:
         """Compute spectral norm of each core.
 
@@ -533,3 +628,24 @@ class TensorRingCores(nn.Module):
         for s in self.structure.emb_factor_sizes:
             full_D *= s
         return full_V * full_D
+
+    def get_emb_contraction(self) -> torch.Tensor:
+        """Get embedding contraction, using cache if valid.
+
+        Cache is invalidated on gauge fix and parameter updates.
+        """
+        if self._emb_contraction_valid and self._emb_contraction_cache is not None:
+            return self._emb_contraction_cache
+
+        from .contraction import compute_emb_precontraction
+        self._emb_contraction_cache = compute_emb_precontraction(list(self.emb_cores))
+        self._emb_contraction_valid = True
+        return self._emb_contraction_cache
+
+    def invalidate_emb_cache(self) -> None:
+        """Invalidate the embedding contraction cache.
+
+        Should be called after parameter updates (e.g., optimizer.step).
+        """
+        self._emb_contraction_valid = False
+        self._emb_contraction_cache = None

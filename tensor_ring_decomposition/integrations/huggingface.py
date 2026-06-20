@@ -25,16 +25,36 @@ class HuggingFaceTensorRingEmbedding:
         model_name: str,
         rank: int,
         ring_components: int = 4,
+        cache_dir: Optional[str] = None,
+        trust_remote_code: bool = False,
+        max_model_size_gb: float = 5.0,
+        download_timeout: int = 300,
         **kwargs,
     ) -> TensorRingEmbedding:
         """Load HF model embedding, decompose via TR.
 
         Delegates to ``load_from_transformers`` for efficient model loading
         (low_cpu_mem_usage, cache management), then creates the TR embedding.
+
+        Args:
+            model_name: HF model identifier.
+            rank: TR rank.
+            ring_components: Number of ring components.
+            cache_dir: HF cache directory.
+            trust_remote_code: Whether to allow execution of remote code. Default False.
+            max_model_size_gb: Max model size in GB to prevent OOM.
+            download_timeout: Download timeout in seconds.
+            **kwargs: Additional args passed to TensorRingEmbedding.
         """
         from ..loaders.loaders import load_from_transformers
 
-        weight = load_from_transformers(model_name)
+        weight = load_from_transformers(
+            model_name,
+            cache_dir=cache_dir,
+            trust_remote_code=trust_remote_code,
+            max_model_size_gb=max_model_size_gb,
+            download_timeout=download_timeout,
+        )
         if weight.device.type == "cuda":
             import torch
             torch.cuda.empty_cache()

@@ -41,9 +41,10 @@ def save(
     weights = {name: param.data for name, param in embedding.named_parameters()}
 
     # Serialize to bytes, write to disk, compute hash from same bytes
-    weights_bytes = sf.save(weights)
-    weights_path = Path(path).with_suffix("").with_suffix(".safetensors")
-    weights_path.write_bytes(weights_bytes)
+    weights_path = Path(path).with_suffix('').with_suffix('.safetensors')
+    sf.save_file(weights, weights_path)
+    # For hash computation, read the written file bytes
+    weights_bytes = weights_path.read_bytes()
 
     if secret_key:
         core_hash = hmac.new(secret_key, weights_bytes, hashlib.sha256).hexdigest()
@@ -119,12 +120,13 @@ def load(
         )
 
     # Load weights from bytes (no second file read)
-    weights = sf.load(weights_bytes)
+    weights = sf.load_file(weights_path, device=device) if device is not None else sf.load_file(weights_path)
     if device is not None:
         weights = {k: v.to(device) for k, v in weights.items()}
 
     # Reconstruct embedding with full config roundtrip
     config = manifest["tr_config"]
+    skip = {"_skip_init": True}
     if config.get("used_explicit_ranks") and config.get("structure_ranks"):
         embedding = TensorRingEmbedding(
             vocab_size=config["vocab_size"],
@@ -139,6 +141,7 @@ def load(
             padding_idx=config.get("padding_idx"),
             max_seq_len=config.get("max_seq_len"),
             spectral_reg_coeff=config.get("spectral_reg_coeff", 0.0),
+            **skip,
         )
     else:
         embedding = TensorRingEmbedding(
@@ -153,6 +156,7 @@ def load(
             padding_idx=config.get("padding_idx"),
             max_seq_len=config.get("max_seq_len"),
             spectral_reg_coeff=config.get("spectral_reg_coeff", 0.0),
+            **skip,
         )
     embedding.load_state_dict(weights)
 

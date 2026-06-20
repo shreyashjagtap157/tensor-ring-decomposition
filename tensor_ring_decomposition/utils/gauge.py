@@ -120,7 +120,6 @@ def _power_iteration_svd(A: torch.Tensor, n_iter: int = 15) -> torch.Tensor:
             u = u / u_norm
         v = A.T @ u
 
-    # Normalize v before Rayleigh quotient to get σ (not σ²)
-    v = v / v.norm()
-    sigma = (u * (A @ v)).sum().abs()
+    # Estimate sigma as the norm of A @ v after power iteration
+    sigma = (A @ v).norm()
     return sigma

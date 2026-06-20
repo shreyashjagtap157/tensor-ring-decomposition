@@ -96,7 +96,9 @@ def _quantize_tensor_per_channel(t: torch.Tensor, dim: int = 0) -> Tuple[torch.T
         abs_max = t.abs()
     abs_max = abs_max.clamp(min=1e-8)
     scales = abs_max / 127.0
-    q = (t / scales.view(-1, *([1] * (t.ndim - 1)))).round().clamp(-128, 127).to(torch.int8)
+    scale_shape = [1] * t.ndim
+    scale_shape[dim] = -1
+    q = (t / scales.view(*scale_shape)).round().clamp(-128, 127).to(torch.int8)
     return q, scales, torch.zeros_like(scales, dtype=torch.int)
 
 
@@ -110,6 +112,7 @@ class STEQuantize(Function):
     @staticmethod
     def backward(ctx, grad_output):
         return grad_output, None
+
 
 def fake_quantize(x, scale):
     return STEQuantize.apply(x, scale)

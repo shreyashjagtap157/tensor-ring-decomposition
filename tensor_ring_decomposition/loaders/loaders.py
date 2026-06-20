@@ -321,21 +321,21 @@ def _check_model_size(
     if index_files:
         # Sharded model - check index
         try:
-            index_path = hf_hub_download(model_name, index_files[0], cache_dir=cache_dir, timeout=timeout)
+            index_path = hf_hub_download(model_name, index_files[0], cache_dir=cache_dir)
             import json
             with open(index_path) as f:
                 index_data = json.load(f)
             weight_map = index_data.get("weight_map", {})
             # Sum sizes from weight map
             for safetensor_file in set(weight_map.values()):
-                file_path = hf_hub_download(model_name, safetensor_file, cache_dir=cache_dir, timeout=timeout)
+                file_path = hf_hub_download(model_name, safetensor_file, cache_dir=cache_dir)
                 total_size += os.path.getsize(file_path)
         except Exception as e:
             logger.warning(f"Could not check sharded model size: {e}")
     elif safetensor_files:
         try:
             for sf in safetensor_files:
-                file_path = hf_hub_download(model_name, sf, cache_dir=cache_dir, timeout=timeout)
+                file_path = hf_hub_download(model_name, sf, cache_dir=cache_dir)
                 total_size += os.path.getsize(file_path)
         except Exception as e:
             logger.warning(f"Could not check model size: {e}")
@@ -421,7 +421,7 @@ def _load_embedding_only(
     single_files = [f for f in files if f.endswith(".safetensors") and "index" not in f]
 
     if index_files:
-        index_path = hf_hub_download(model_name, index_files[0], cache_dir=cache_dir, timeout=download_timeout)
+        index_path = hf_hub_download(model_name, index_files[0], cache_dir=cache_dir)
         with open(index_path) as f:
             index_data = json.load(f)
         weight_map = index_data.get("weight_map", {})
@@ -450,10 +450,10 @@ def _load_embedding_only(
 
         if target_key and target_key in weight_map:
             safetensor_file = weight_map[target_key]
-            safetensor_path = hf_hub_download(model_name, safetensor_file, cache_dir=cache_dir, timeout=download_timeout)
+            safetensor_path = hf_hub_download(model_name, safetensor_file, cache_dir=cache_dir)
             return load_from_safetensors(safetensor_path, key=target_key, device=device)
     elif single_files:
-        safetensor_path = hf_hub_download(model_name, single_files[0], cache_dir=cache_dir, timeout=download_timeout)
+        safetensor_path = hf_hub_download(model_name, single_files[0], cache_dir=cache_dir)
         weight = load_from_safetensors(safetensor_path, device=device)
         if weight is not None:
             return weight
@@ -535,10 +535,7 @@ def load_embedding_matrix(
                 continue
 
     return load_from_transformers(
-        source, 
-        device, 
+        source,
+        device,
         cache_dir,
-        trust_remote_code=trust_remote_code,
-        max_model_size_gb=max_model_size_gb,
-        download_timeout=download_timeout,
     )

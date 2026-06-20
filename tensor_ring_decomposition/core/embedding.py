@@ -30,9 +30,10 @@ import torch.distributed as dist
 if TYPE_CHECKING:
     from ..models.registry import ModelProfile
 
-from .factorization import compute_ring_structure, compute_mixed_radix_strides
+from .factorization import compute_ring_structure, compute_mixed_radix_strides, compute_tapered_ranks
 from .cores import TensorRingCores
 from .contraction import (
+    gather_vocab_cores,
     compute_emb_precontraction,
     ring_closure,
 )
@@ -95,7 +96,7 @@ class TensorRingEmbedding(nn.Module):
         ring_components: int = 4,
         target_compression: Optional[float] = None,
         target_params: Optional[int] = None,
-        split_mode: Literal["balanced", "proportional", "manual"] = "balanced",
+        split_mode: Literal["balanced", "proportional", "manual", "param_balanced"] = "balanced",
         init_method: Literal["uniform", "normal", "kaiming", "svd", "tr_svd", "als", "distribution_aware"] = "uniform",
         gauge_fix: Literal["none", "left", "right", "both"] = "left",
         gauge_fix_interval: int = 1000,
@@ -107,6 +108,7 @@ class TensorRingEmbedding(nn.Module):
         validate_indices: bool = False,
         auto_pad: bool = True,
         max_padding_pct: float = 0.15,
+        gradient_checkpointing: bool = False,
         _skip_init: bool = False,
     ):
         super().__init__()
@@ -138,6 +140,7 @@ class TensorRingEmbedding(nn.Module):
         self._validate_indices_flag = validate_indices
         self.auto_pad = auto_pad
         self.max_padding_pct = max_padding_pct
+        self.gradient_checkpointing = gradient_checkpointing
 
         if target_compression is not None or target_params is not None:
             rank = self._solve_rank(
@@ -236,6 +239,17 @@ class TensorRingEmbedding(nn.Module):
                 f"target_compression must be > 1.0, got {target_compression}"
             )
 
+    def _param_fn(self, r: int) -> int:
+        struct = compute_ring_structure(
+            self.vocab_size, self.embedding_dim, self.ring_components, r
+        )
+        total = 0
+        for i in range(struct.n_vocab_cores):
+            total += struct.vocab_factor_sizes[i] * r * r
+        for i in range(struct.n_emb_cores):
+            total += struct.emb_factor_sizes[i] * r * r
+        return total
+
     def _solve_rank(
         self,
         vocab_size: int,
@@ -252,27 +266,28 @@ class TensorRingEmbedding(nn.Module):
         else:
             tp = vocab_size * embedding_dim / 10.0
 
-        from .factorization import compute_ring_structure
-
-        def param_fn(r: int) -> int:
-            struct = compute_ring_structure(vocab_size, embedding_dim, ring_components, r)
-            total = 0
-            for i in range(struct.n_vocab_cores):
-                total += struct.vocab_factor_sizes[i] * r * r
-            for i in range(struct.n_emb_cores):
-                total += struct.emb_factor_sizes[i] * r * r
-            return total
-
         lo, hi = 2, max(2, int(math.isqrt(vocab_size * embedding_dim)))
         best = 2
         while lo <= hi:
             mid = (lo + hi) // 2
-            if param_fn(mid) <= tp:
+            if self._param_fn(mid) <= tp:
                 best = mid
                 lo = mid + 1
             else:
                 hi = mid - 1
         return max(2, best)
+
+    @staticmethod
+    def _param_count_at_rank_static(
+        vocab_size: int, embedding_dim: int, ring_components: int, rank: int,
+    ) -> int:
+        struct = compute_ring_structure(vocab_size, embedding_dim, ring_components, rank)
+        total = 0
+        for i in range(struct.n_vocab_cores):
+            total += struct.vocab_factor_sizes[i] * rank * rank
+        for i in range(struct.n_emb_cores):
+            total += struct.emb_factor_sizes[i] * rank * rank
+        return total
 
     @staticmethod
     def optimal_rank(
@@ -301,16 +316,6 @@ class TensorRingEmbedding(nn.Module):
         Returns:
             Optimal rank (integer >= 2)
         """
-        from .factorization import compute_ring_structure
-
-        def param_fn(r: int) -> int:
-            struct = compute_ring_structure(vocab_size, embedding_dim, ring_components, r)
-            total = 0
-            for i in range(struct.n_vocab_cores):
-                total += struct.vocab_factor_sizes[i] * r * r
-            for i in range(struct.n_emb_cores):
-                total += struct.emb_factor_sizes[i] * r * r
-            return total
 
         dense = vocab_size * embedding_dim
 
@@ -328,13 +333,10 @@ class TensorRingEmbedding(nn.Module):
 
         lo, hi = 2, int(math.isqrt(dense))
 
-        def feasible(r: int) -> bool:
-            return param_fn(r) <= target
-
         best = 2
         while lo <= hi:
             mid = (lo + hi) // 2
-            if feasible(mid):
+            if TensorRingEmbedding._param_count_at_rank_static(vocab_size, embedding_dim, ring_components, mid) <= target:
                 best = mid
                 lo = mid + 1
             else:
@@ -424,21 +426,11 @@ class TensorRingEmbedding(nn.Module):
             lo = 2
             hi = max(2, int(math.isqrt(dense)) // 2)
 
-        def param_fn(r: int) -> int:
-            from .factorization import compute_ring_structure
-            struct = compute_ring_structure(V, D, ring_components, r)
-            total = 0
-            for i in range(struct.n_vocab_cores):
-                total += struct.vocab_factor_sizes[i] * r * r
-            for i in range(struct.n_emb_cores):
-                total += struct.emb_factor_sizes[i] * r * r
-            return total
-
         # Binary search for rank that meets parameter constraint
         best_rank = lo
         while lo <= hi:
             mid = (lo + hi) // 2
-            if param_fn(mid) <= target:
+            if cls._param_count_at_rank_static(V, D, ring_components, mid) <= target:
                 best_rank = mid
                 lo = mid + 1
             else:
@@ -450,14 +442,14 @@ class TensorRingEmbedding(nn.Module):
             best_error = float("inf")
             ref_emb = cls(V, D, rank=max(2, best_rank - 4), ring_components=ring_components, device=device)
             for r in candidates:
-                if param_fn(r) > dense * 1.1:
+                if cls._param_count_at_rank_static(V, D, ring_components, r) > dense * 1.1:
                     continue
                 if r != ref_emb.rank:
                     ref_emb = cls(V, D, rank=r, ring_components=ring_components, device=device)
                 ref_emb.cores.initialize("svd", embedding_matrix, steps=training_steps)
                 error = ref_emb.reconstruction_error(embedding_matrix)
                 if verbose:
-                    logger.info(f"  Rank {r}: params={param_fn(r):,}, MSE={error:.4f}")
+                    logger.info(f"  Rank {r}: params={cls._param_count_at_rank_static(V, D, ring_components, r):,}, MSE={error:.4f}")
                 if error < best_error:
                     best_error = error
                     best_rank = r
@@ -552,20 +544,11 @@ class TensorRingEmbedding(nn.Module):
         return best
 
     @staticmethod
-    def _param_count_at_rank(V: int, D: int, ring_components: int, rank: int, auto_pad: bool = True) -> int:
-        """Compute parameter count for a given rank without constructing the embedding."""
-        from .factorization import compute_ring_structure
-        struct = compute_ring_structure(V, D, ring_components, rank, auto_pad=auto_pad)
-        total = 0
-        for i in range(struct.n_vocab_cores):
-            total += struct.vocab_factor_sizes[i] * rank * rank
-        for i in range(struct.n_emb_cores):
-            total += struct.emb_factor_sizes[i] * rank * rank
-        return total
+    def _param_count_at_rank(V: int, D: int, ring_components: int, rank: int) -> int:
+        return TensorRingEmbedding._param_count_at_rank_static(V, D, ring_components, rank)
 
     def _vocab_chain(self, flat_indices: torch.Tensor) -> torch.Tensor:
         """Compute vocab chain: decompose indices, gather, chain bmm."""
-        from .contraction import gather_vocab_cores
         return gather_vocab_cores(
             flat_indices,
             list(self.cores.vocab_cores),
@@ -576,6 +559,12 @@ class TensorRingEmbedding(nn.Module):
     def _compute_emb_contraction(self) -> torch.Tensor:
         """Compute embedding cores precontraction. Returns (R, D, R)."""
         return compute_emb_precontraction(list(self.cores.emb_cores))
+
+    def _forward_impl(self, flat: torch.Tensor, emb_contraction: torch.Tensor) -> torch.Tensor:
+        """Forward computation implementation (can be checkpointed)."""
+        vocab_result = self._vocab_chain(flat)
+        output = ring_closure(vocab_result, emb_contraction)
+        return output
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """Compressed embedding lookup with input validation and gauge fixing.
@@ -603,18 +592,34 @@ class TensorRingEmbedding(nn.Module):
         original_shape = indices.shape
         flat = indices.view(-1)
 
-        vocab_result = self._vocab_chain(flat)
-
-        if self.training or not self._cache_valid:
+        if self.training:
+            # Always recompute in training mode so the autograd graph
+            # is fresh for each backward pass.  Using a cached tensor
+            # from a prior step retains a stale graph that triggers
+            # "backward through the graph a second time" after
+            # optimizer.step() mutates the parameters.
+            emb_contraction = self._compute_emb_contraction()
+        elif not self._cache_valid:
             emb_contraction = self._compute_emb_contraction()
         else:
             emb_contraction = self._emb_cache
 
-        output = ring_closure(vocab_result, emb_contraction)
+        if self.training and self.gradient_checkpointing:
+            output = torch.utils.checkpoint.checkpoint(
+                self._forward_impl, flat, emb_contraction,
+                use_reentrant=False
+            )
+        else:
+            output = self._forward_impl(flat, emb_contraction)
 
         # Slice to original embedding_dim if padded
         if not torch.jit.is_tracing() and output.shape[-1] != self.embedding_dim:
             output = output[..., :self.embedding_dim]
+
+        # Zero out padding token embeddings if padding_idx is set
+        if self.padding_idx is not None:
+            pad_mask = (flat == self.padding_idx)
+            output = output.masked_fill(pad_mask.unsqueeze(1), 0.0)
 
         return output.view(*original_shape, self.embedding_dim)
 
@@ -648,6 +653,18 @@ class TensorRingEmbedding(nn.Module):
         """Switch to training mode and clear eval cache."""
         self.train(True)
         return self
+
+    def set_gradient_checkpointing(self, enabled: bool) -> None:
+        """Enable or disable gradient checkpointing.
+
+        When enabled, uses ``torch.utils.checkpoint`` to trade compute for
+        memory during training. Reduces memory usage by ~50% at the cost of
+        ~20-30% extra compute during backward pass.
+
+        Args:
+            enabled: Whether to enable gradient checkpointing.
+        """
+        self.gradient_checkpointing = enabled
 
     def reset_parameters(self) -> None:
         """Re-initialize cores using the original init method."""
@@ -694,6 +711,180 @@ class TensorRingEmbedding(nn.Module):
 
     def spectral_norms(self) -> Dict[str, float]:
         return self.cores.spectral_norms()
+
+    def shard(self, device_ids: Optional[List[int]] = None) -> List["TensorRingEmbedding"]:
+        """Shard embedding cores across devices for model parallelism.
+
+        Each shard contains a subset of vocab and embedding cores.
+        All shards are self-contained and can perform forward passes independently.
+
+        Args:
+            device_ids: List of device IDs to shard across. If None, uses
+                       all available CUDA devices.
+
+        Returns:
+            List of sharded TensorRingEmbedding copies, one per device.
+
+        Example:
+            shards = emb.shard([0, 1, 2, 3])
+            # 4 shards, each with 1/4 of the cores
+        """
+        if device_ids is None:
+            if torch.cuda.is_available():
+                device_ids = list(range(torch.cuda.device_count()))
+            else:
+                device_ids = [0]
+
+        if len(device_ids) == 1:
+            return [self]
+
+        n_devices = len(device_ids)
+        n_vocab = len(self.cores.vocab_cores)
+        n_emb = len(self.cores.emb_cores)
+        n_total = n_vocab + n_emb
+
+        shards: List[TensorRingEmbedding] = []
+        cores_per_shard = (n_total + n_devices - 1) // n_devices
+
+        for i, device_id in enumerate(device_ids):
+            start_idx = i * cores_per_shard
+            end_idx = min((i + 1) * cores_per_shard, n_total)
+            # Correctly compute vocab and embedding core indices for this shard
+            vocab_start = start_idx
+            vocab_end = min(end_idx, n_vocab)
+            vocab_indices = list(range(vocab_start, vocab_end))
+            # Embedding cores start after vocab cores in the combined list
+            emb_start = max(start_idx, n_vocab) - n_vocab
+            emb_end = max(end_idx - n_vocab, 0)
+            emb_indices = list(range(emb_start, emb_end))
+
+            shard = self._slice_shard(vocab_indices, emb_indices, device_id)
+            shards.append(shard)
+
+        return shards
+
+    def _slice_shard(
+        self, vocab_indices: List[int], emb_indices: List[int], device: int
+    ) -> "TensorRingEmbedding":
+        """Create a shard containing only specified core indices."""
+        device = torch.device(f"cuda:{device}" if isinstance(device, int) else device)
+
+        if not vocab_indices and not emb_indices:
+            raise ValueError("At least one core must be assigned to each shard")
+
+        vocab_sizes = [self.structure.vocab_factor_sizes[i] for i in vocab_indices] if vocab_indices else []
+        emb_sizes = [self.structure.emb_factor_sizes[i - len(self.cores.vocab_cores)] for i in emb_indices] if emb_indices else []
+
+        all_sizes = vocab_sizes + emb_sizes
+        all_ranks = self.structure.ranks.copy()
+
+        if vocab_sizes and emb_sizes:
+            first_vocab_idx = vocab_indices[0]
+            last_vocab_idx = vocab_indices[-1]
+            first_emb_idx = emb_indices[0] - len(self.cores.vocab_cores)
+            last_emb_idx = emb_indices[-1] - len(self.cores.vocab_cores)
+
+            if first_vocab_idx > 0:
+                all_ranks[0] = self.structure.ranks[0]
+            if last_emb_idx < len(self.cores.emb_cores) - 1:
+                all_ranks[-1] = self.structure.ranks[-1]
+
+        ring_components = len(all_sizes)
+        if ring_components < 2:
+            raise ValueError(f"Need at least 2 cores per shard, got {ring_components}")
+
+        k = len(vocab_sizes)
+        m = len(emb_sizes)
+
+        struct = compute_ring_structure(
+            self.vocab_size, self.embedding_dim, ring_components,
+            rank=self._rank or max(all_ranks),
+            split_mode="balanced",
+            ranks=all_ranks if all_ranks != self.structure.ranks else None,
+            auto_pad=self.auto_pad,
+            max_padding_pct=self.max_padding_pct,
+        )
+
+        shard_emb = TensorRingEmbedding(
+            self.vocab_size, self.embedding_dim,
+            rank=self._rank, ranks=all_ranks,
+            ring_components=ring_components,
+            split_mode="balanced",
+            init_method="uniform",
+            gauge_fix=self.gauge_fix,
+            gauge_fix_interval=self.gauge_fix_interval,
+            padding_idx=self.padding_idx,
+            max_seq_len=self.max_seq_len,
+            spectral_reg_coeff=self.cores.spectral_reg_coeff,
+            device=device,
+            dtype=self._dtype,
+            validate_indices=self._validate_indices_flag,
+            auto_pad=self.auto_pad,
+            max_padding_pct=self.max_padding_pct,
+            _skip_init=True,
+        )
+
+        with torch.no_grad():
+            for new_idx, old_idx in enumerate(vocab_indices):
+                if old_idx < len(shard_emb.cores.vocab_cores):
+                    shard_emb.cores.vocab_cores[new_idx].data.copy_(
+                        self.cores.vocab_cores[old_idx].data.to(device)
+                    )
+            for new_idx, old_idx in enumerate(emb_indices):
+                adjusted_idx = old_idx - len(self.cores.vocab_cores)
+                if 0 <= adjusted_idx < len(shard_emb.cores.emb_cores):
+                    shard_emb.cores.emb_cores[adjusted_idx].data.copy_(
+                        self.cores.emb_cores[adjusted_idx].data.to(device)
+                    )
+
+        return shard_emb
+
+    def gather(self, shards: List["TensorRingEmbedding"], original_device: torch.device) -> "TensorRingEmbedding":
+        """Gather sharded embeddings back into a single embedding on original_device.
+
+        Args:
+            shards: List of sharded TensorRingEmbedding from ``shard()``.
+            original_device: Device to gather to.
+
+        Returns:
+            Combined TensorRingEmbedding on original_device.
+        """
+        if not shards:
+            return self
+
+        n_vocab = len(self.cores.vocab_cores)
+        n_emb = len(self.cores.emb_cores)
+
+        result = TensorRingEmbedding(
+            self.vocab_size, self.embedding_dim,
+            rank=self._rank, ranks=self.structure.ranks,
+            ring_components=self.ring_components,
+            split_mode=self.split_mode,
+            init_method="uniform",
+            gauge_fix=self.gauge_fix,
+            gauge_fix_interval=self.gauge_fix_interval,
+            padding_idx=self.padding_idx,
+            max_seq_len=self.max_seq_len,
+            spectral_reg_coeff=self.cores.spectral_reg_coeff,
+            device=original_device,
+            dtype=self._dtype,
+            validate_indices=self._validate_indices_flag,
+            auto_pad=self.auto_pad,
+            max_padding_pct=self.max_padding_pct,
+            _skip_init=True,
+        )
+
+        with torch.no_grad():
+            for i in range(n_vocab):
+                result.cores.vocab_cores[i].data.copy_(
+                    self.cores.vocab_cores[i].data.to(original_device)
+                )
+            for i in range(n_emb):
+                result.cores.emb_cores[i].data.copy_(
+                    self.cores.emb_cores[i].data.to(original_device)
+                )
+
+        return result
 
     def reconstruction_error(self, original_matrix: torch.Tensor) -> float:
         with torch.no_grad():
@@ -824,6 +1015,41 @@ class TensorRingEmbedding(nn.Module):
                 return base_error.item()
 
             return self.reconstruction_error(original_matrix)
+
+    def sampled_reconstruction_error(
+        self,
+        original_matrix: torch.Tensor,
+        n_samples: int = 1024,
+        seed: Optional[int] = None,
+    ) -> float:
+        """Compute reconstruction error on a random sample of rows.
+
+        For very large matrices where computing the full reconstruction is expensive,
+        this method samples random rows and computes error only on those.
+
+        Args:
+            original_matrix: The original (V, D) embedding matrix.
+            n_samples: Number of rows to sample. Defaults to 1024.
+            seed: Random seed for reproducibility.
+
+        Returns:
+            Estimated reconstruction error on the sampled rows.
+        """
+        V, D = original_matrix.shape
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        n_samples = min(n_samples, V)
+        sample_idx = torch.randperm(V)[:n_samples]
+        sampled_original = original_matrix[sample_idx]
+
+        with torch.no_grad():
+            sampled_recon = self.forward(sample_idx)
+            error = torch.norm(sampled_original - sampled_recon)
+            baseline = torch.norm(sampled_original)
+            if baseline < 1e-10:
+                return 0.0
+            return (error / baseline).item()
 
     @classmethod
     def spectral_gap_rank_suggestion(
@@ -1237,8 +1463,6 @@ class TensorRingEmbedding(nn.Module):
         else:
             emb_contraction = self._emb_cache
 
-        from .contraction import ring_closure
-
         for i in range(accum_steps):
             start = i * micro_batch_size
             end = start + micro_batch_size if i < accum_steps - 1 else B
@@ -1266,6 +1490,11 @@ class TensorRingEmbedding(nn.Module):
     @property
     def num_parameters(self) -> int:
         return self.cores.parameter_count()
+
+    @property
+    def dense_parameter_count(self) -> int:
+        """Total number of parameters in an equivalent dense embedding (V × D)."""
+        return self.vocab_size * self.embedding_dim
 
     @property
     def rank(self) -> int:
@@ -1442,32 +1671,84 @@ class TensorRingEmbedding(nn.Module):
         )
 
     @classmethod
-    def suggest_rank(cls, model_name: str, target_compression: Optional[float] = None) -> int:
-        """Suggest a TR rank for a known model.
+    def suggest_rank(cls, model_name: Optional[str] = None,
+                  embedding_matrix: Optional[torch.Tensor] = None,
+                  vocab_size: Optional[int] = None,
+                  embedding_dim: Optional[int] = None,
+                  ring_components: int = 4,
+                  target_compression: Optional[float] = None,
+                  target_params: Optional[int] = None,
+                  target_mse: Optional[float] = None,
+                  variance_threshold: float = 0.9999,
+                  max_rank: Optional[int] = None) -> int:
+        """Unified API for suggesting TR rank.
 
-        Looks up the model in ``ModelRegistry`` and returns the default rank,
-        or computes one from target_compression.
+        This method dispatches to the appropriate rank selection strategy based
+        on available inputs:
+        - Registry lookup: if model_name is known
+        - Matrix-based: if embedding_matrix is provided (SVD knee detection)
+        - Analytical: if vocab_size/embedding_dim + targets are provided
+        - Default: 8 if no information available
 
         Args:
-            model_name: Model identifier (e.g., ``"bert-base-uncased"``).
+            model_name: Model identifier for registry lookup.
+            embedding_matrix: (V, D) matrix for SVD-based rank selection.
+            vocab_size: Vocabulary size (used with target_* params).
+            embedding_dim: Embedding dimension (used with target_* params).
+            ring_components: Number of ring components.
             target_compression: Desired compression ratio.
+            target_params: Target parameter count.
+            target_mse: Target relative MSE.
+            variance_threshold: For matrix-based selection (0-1).
+            max_rank: Maximum rank to consider.
 
         Returns:
             Suggested rank.
         """
-        from ..models.registry import ModelRegistry as _MR
+        # Priority 1: Registry lookup
+        if model_name is not None:
+            from ..models.registry import ModelRegistry as _MR
+            profile = _MR.get(model_name)
+            if profile is not None:
+                if target_compression is not None:
+                    return profile.rank_for_compression(target_compression)
+                return profile.default_rank
+            # If model_name was given but not in the registry and no
+            # other information source is available, raise rather than
+            # silently falling back to a default rank.
+            if embedding_matrix is None and (vocab_size is None or embedding_dim is None):
+                raise ValueError(
+                    f"Model '{model_name}' not found in registry and no "
+                    f"embedding_matrix or vocab_size+embedding_dim provided. "
+                    f"Available models: use list_models() to see registry."
+                )
 
-        profile = _MR.get(model_name)
-        if profile is None:
-            raise ValueError(
-                f"Unknown model '{model_name}'. "
-                f"Register it first or use a built-in profile. "
-                f"Try ModelRegistry.list_all() for available models."
+        # Priority 2: Matrix-based SVD knee detection
+        if embedding_matrix is not None:
+            return cls.suggest_rank_from_matrix(
+                embedding_matrix, ring_components=ring_components,
+                variance_threshold=variance_threshold, max_rank=max_rank
             )
 
-        if target_compression is not None:
-            return profile.rank_for_compression(target_compression)
-        return profile.default_rank
+        # Priority 3: Analytical from vocab_size + embedding_dim
+        if vocab_size is not None and embedding_dim is not None:
+            if target_mse is not None:
+                raise ValueError(
+                    "target_mse requires embedding_matrix for accurate SVD analysis"
+                )
+            return cls.optimal_rank(
+                vocab_size, embedding_dim, ring_components,
+                target_compression=target_compression,
+                target_params=target_params
+            )
+
+        # Priority 4: Fallback
+        logger.warning(
+            "No rank information provided, using default rank=8. "
+            "Provide model_name, embedding_matrix, or vocab_size+embedding_dim "
+            "for better rank selection."
+        )
+        return 8
 
     def export(
         self,
@@ -1682,11 +1963,6 @@ class TensorRingEmbedding(nn.Module):
                 tr_emb = self.tr_emb
                 tr_emb_cores = list(tr_emb.cores.vocab_cores)
                 emb_cores = list(tr_emb.cores.emb_cores)
-                from .contraction import (
-                    compute_emb_precontraction,
-                    gather_vocab_cores,
-                    ring_closure,
-                )
                 emb_cont = compute_emb_precontraction(emb_cores)
                 strides = tr_emb._vocab_strides
                 factor_sizes = tr_emb.structure.vocab_factor_sizes
@@ -1767,9 +2043,6 @@ class TensorRingEmbedding(nn.Module):
         Returns:
             Dict with ``"final_loss"`` and ``"mse"``.
         """
-        from .contraction import compute_emb_precontraction, ring_closure
-        from .factorization import compute_mixed_radix_strides
-
         V, D = teacher_matrix.shape
         teacher_matrix = teacher_matrix.to(dtype=self._dtype)
         strides = compute_mixed_radix_strides(self.structure.vocab_factor_sizes)
@@ -2031,7 +2304,7 @@ class ZipfHybridTensorRingEmbedding(nn.Module):
         ring_components: int = 4,
         target_compression: Optional[float] = None,
         target_params: Optional[int] = None,
-        split_mode: Literal["balanced", "proportional", "manual"] = "balanced",
+        split_mode: Literal["balanced", "proportional", "manual", "param_balanced"] = "balanced",
         init_method: Literal["uniform", "normal", "kaiming", "svd", "tr_svd", "als", "distribution_aware"] = "uniform",
         gauge_fix: Literal["none", "left", "right", "both"] = "left",
         gauge_fix_interval: int = 1000,

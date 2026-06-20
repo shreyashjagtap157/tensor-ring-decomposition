@@ -523,3 +523,14 @@ class TestQuantizedTensorRingEmbedding:
         o_a = qemb(torch.tensor([0]))
         o_b = qemb(torch.tensor([1]))
         assert not torch.allclose(o_a, o_b, atol=1e-4)
+
+    def test_per_channel_dim_nonzero(self):
+        from tensor_ring_decomposition.quantization.quantize import _quantize_tensor_per_channel
+        t = torch.randn(2, 5, 8)
+        # dim=1 (second dimension) — verify shape and no error
+        q, scales, zeros = _quantize_tensor_per_channel(t, dim=1)
+        assert q.shape == t.shape
+        assert scales.shape == (5,)
+        # Verify that values are within int8 range (outer bounds)
+        assert q.min() >= -128
+        assert q.max() <= 127

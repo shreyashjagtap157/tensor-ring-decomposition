@@ -418,14 +418,16 @@ class TestLoadFromGguf:
 
 class TestLoadFromTransformers:
     def test_missing_transformers_package_raises(self):
-        with patch.dict("sys.modules", {"transformers": None}):
-            with pytest.raises(ImportError, match="transformers"):
-                load_from_transformers("bert-base-uncased")
+        with patch("tensor_ring_decomposition.loaders.loaders._load_embedding_only", return_value=None):
+            with patch.dict("sys.modules", {"transformers": None}):
+                with pytest.raises(ImportError, match="transformers"):
+                    load_from_transformers("bert-base-uncased")
 
     def test_import_error_when_not_installed(self):
-        with patch.dict("sys.modules", {"transformers": None}):
-            with pytest.raises(ImportError, match="transformers"):
-                load_from_transformers("bert-base-uncased")
+        with patch("tensor_ring_decomposition.loaders.loaders._load_embedding_only", return_value=None):
+            with patch.dict("sys.modules", {"transformers": None}):
+                with pytest.raises(ImportError, match="transformers"):
+                    load_from_transformers("bert-base-uncased")
 
     def test_successful_load_with_mock(self, tmp_dir):
         weight_tensor = torch.randn(100, 32)

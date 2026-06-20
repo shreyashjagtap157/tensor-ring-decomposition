@@ -64,8 +64,6 @@ def gather_vocab_cores(
         result = torch.bmm(result, cg)
     return result
 
-
-
 def compute_emb_precontraction(emb_cores: List[torch.Tensor]) -> torch.Tensor:
     """Compute embedding cores precontraction via sequential bmm.
 
@@ -95,43 +93,27 @@ def compute_emb_precontraction(emb_cores: List[torch.Tensor]) -> torch.Tensor:
 def ring_closure(
     vocab_result: torch.Tensor,
     emb_contraction: torch.Tensor,
-    use_efficient: bool = False,
 ) -> torch.Tensor:
     """Combine vocab chain result with precontracted emb contraction.
+
+    Uses the einsum implementation exclusively (fast & numerically stable).
+    The legacy loop-based ``_ring_closure_efficient`` has been removed; the
+    ``use_efficient`` flag is also removed from the public signature.
 
     Args:
         vocab_result: (B, R, R)
         emb_contraction: (R, D, R)
-        use_efficient: When True, use the Python-loop implementation. This is
-            primarily kept for benchmarking and backward compatibility;
-            the einsum path is faster for the typical rank range (R <= 256)
-            because it dispatches a single fused BLAS contraction instead
-            of R Python-level torch.mm calls.
 
     Returns:
         (B, D) output embeddings
     """
-    if use_efficient:
-        return _ring_closure_efficient(vocab_result, emb_contraction)
     return _ring_closure_einsum(vocab_result, emb_contraction)
 
 
-def _ring_closure_efficient(
-    vocab_result: torch.Tensor,
-    emb_contraction: torch.Tensor,
-) -> torch.Tensor:
-    """Memory-efficient ring closure via R-dimension loop."""
-    R = vocab_result.shape[1]
-    B = vocab_result.shape[0]
-    D = emb_contraction.shape[1]
-    device = vocab_result.device
-    dtype = vocab_result.dtype
-
-    output = torch.zeros(B, D, device=device, dtype=dtype)
-    for r in range(R):
-        output += torch.mm(vocab_result[:, r, :], emb_contraction[:, :, r])
-
-    return output
+# NOTE: The original memory‑efficient loop implementation (`_ring_closure_efficient`) has been removed.
+# The `ring_closure` function now always uses the efficient einsum implementation, which is the
+# recommended path for all rank sizes (R ≤ 256). Keeping the legacy loop would add maintenance
+# overhead without any performance benefit for typical workloads.
 
 
 def _ring_closure_einsum(

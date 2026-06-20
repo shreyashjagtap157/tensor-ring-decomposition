@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import functools
 import math
+import logging
+logger = logging.getLogger(__name__)
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -47,7 +49,7 @@ def factorize_dimension(dim: int, n_factors: int) -> List[int]:
     return factors
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=1024)
 def _find_best_factors(n: int, k: int) -> Tuple[int, ...]:
     """Memoized recursive search for most balanced factorization.
     
@@ -183,6 +185,78 @@ class RingStructure:
     padded_embedding_dim: Optional[int] = None
 
 
+def compute_tapered_ranks(
+    ring_components: int,
+    base_rank: int,
+    taper_factor: float = 0.5,
+    min_rank: int = 2,
+) -> List[int]:
+    """Compute tapered ranks that decrease toward the middle of the ring.
+    
+    Tapering reduces computational cost while maintaining expressiveness at
+    boundaries. The first and last ranks (boundaries) stay at base_rank,
+    while middle ranks taper down by taper_factor.
+    
+    Args:
+        ring_components: Total number of ring components.
+        base_rank: Rank at boundaries (first and last).
+        taper_factor: Factor to multiply by distance from boundary (0 < taper_factor < 1).
+        min_rank: Minimum allowed rank.
+        
+    Returns:
+        List of ranks of length ring_components + 1.
+        
+    Example:
+        compute_tapered_ranks(4, 8, 0.5) -> [8, 4, 2, 4, 8]
+        compute_tapered_ranks(5, 8, 0.5) -> [8, 4, 2, 2, 4, 8]
+    """
+    total_boundaries = ring_components + 1
+
+    ranks = [base_rank] * total_boundaries
+    middle_ranks = total_boundaries - 2
+    if middle_ranks > 0:
+        for i in range(1, total_boundaries - 1):
+            dist_from_boundary = min(i, total_boundaries - 1 - i)
+            taper = taper_factor ** dist_from_boundary
+            new_rank = max(min_rank, int(base_rank * taper))
+            ranks[i] = new_rank
+
+    return ranks
+
+
+def _compute_param_balanced_split(
+    vocab_size: int, embedding_dim: int, ring_components: int
+) -> Tuple[int, int]:
+    """Compute split that balances parameter count between vocab and emb sides.
+    
+    For param-balanced split:
+        vocab_size * n_vocab_cores ~ embedding_dim * n_emb_cores
+    
+    Args:
+        vocab_size: Vocabulary size.
+        embedding_dim: Embedding dimension.
+        ring_components: Total number of ring components.
+        
+    Returns:
+        Tuple of (n_vocab_cores, n_emb_cores).
+    """
+    best_k = ring_components // 2
+    best_m = ring_components - best_k
+    best_diff = float("inf")
+
+    for k in range(1, ring_components):
+        m = ring_components - k
+        vocab_params = vocab_size * k
+        emb_params = embedding_dim * m
+        diff = abs(vocab_params - emb_params)
+        if diff < best_diff:
+            best_diff = diff
+            best_k = k
+            best_m = m
+
+    return best_k, best_m
+
+
 def compute_ring_structure(
     vocab_size: int,
     embedding_dim: int,
@@ -200,7 +274,8 @@ def compute_ring_structure(
         embedding_dim: Original embedding dimension.
         ring_components: Total number of ring cores.
         rank: Target compression rank.
-        split_mode: How to split components between vocab and embedding ("balanced" or "proportional").
+        split_mode: How to split components between vocab and embedding 
+                   ("balanced", "proportional", "param_balanced", or "manual").
         ranks: Optional explicit ranks per boundary.
         auto_pad: If True, pads vocab_size and embedding_dim to highly factorable numbers
                   to avoid prime/near-prime bottlenecks.
@@ -208,7 +283,7 @@ def compute_ring_structure(
     """
     if ring_components < 2:
         raise ValueError(f"ring_components must be >= 2, got {ring_components}")
-    if split_mode not in ("balanced", "proportional", "manual"):
+    if split_mode not in ("balanced", "proportional", "param_balanced", "manual"):
         raise ValueError(f"Unknown split_mode: {split_mode}")
 
     if split_mode == "balanced":
@@ -218,6 +293,8 @@ def compute_ring_structure(
         total = vocab_size + embedding_dim
         k = max(1, int(round(ring_components * vocab_size / total)))
         m = ring_components - k
+    elif split_mode == "param_balanced":
+        k, m = _compute_param_balanced_split(vocab_size, embedding_dim, ring_components)
     elif split_mode == "manual":
         if ranks is None:
             raise ValueError("split_mode='manual' requires explicit ranks")
