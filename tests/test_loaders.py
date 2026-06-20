@@ -418,14 +418,16 @@ class TestLoadFromGguf:
 
 class TestLoadFromTransformers:
     def test_missing_transformers_package_raises(self):
-        with patch.dict("sys.modules", {"transformers": None}):
-            with pytest.raises(ImportError, match="transformers"):
-                load_from_transformers("bert-base-uncased")
+        with patch("tensor_ring_decomposition.loaders.loaders._load_embedding_only", return_value=None):
+            with patch.dict("sys.modules", {"transformers": None}):
+                with pytest.raises(ImportError, match="transformers"):
+                    load_from_transformers("bert-base-uncased")
 
     def test_import_error_when_not_installed(self):
-        with patch.dict("sys.modules", {"transformers": None}):
-            with pytest.raises(ImportError, match="transformers"):
-                load_from_transformers("bert-base-uncased")
+        with patch("tensor_ring_decomposition.loaders.loaders._load_embedding_only", return_value=None):
+            with patch.dict("sys.modules", {"transformers": None}):
+                with pytest.raises(ImportError, match="transformers"):
+                    load_from_transformers("bert-base-uncased")
 
     def test_successful_load_with_mock(self, tmp_dir):
         weight_tensor = torch.randn(100, 32)
@@ -438,9 +440,10 @@ class TestLoadFromTransformers:
         fake_transformers = MagicMock(spec=[])
         fake_transformers.AutoModel = mock_auto_model
         with patch.dict("sys.modules", {"transformers": fake_transformers}):
-            result = load_from_transformers("test-model", cache_dir=tmp_dir)
+            # trust_remote_code=True bypasses the allowlist guard for the mock path
+            result = load_from_transformers("test-model", cache_dir=tmp_dir, trust_remote_code=True)
             assert result.shape == (100, 32)
-            mock_auto_model.from_pretrained.assert_called_once_with("test-model", cache_dir=tmp_dir, low_cpu_mem_usage=True)
+            mock_auto_model.from_pretrained.assert_called_once_with("test-model", cache_dir=tmp_dir, low_cpu_mem_usage=True, trust_remote_code=True)
 
 
 # ---------------------------------------------------------------------------

@@ -6,12 +6,24 @@ Supports PyTorch, safetensors, NumPy, GGUF, and HuggingFace Transformers.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+# Security constants
+DEFAULT_MAX_MODEL_SIZE_GB = 5
+DEFAULT_DOWNLOAD_TIMEOUT = 300
+KNOWN_SAFE_MODEL_PREFIXES = (
+    "bert-", "roberta-", "distilbert-", "albert-", "electra-", "xlnet-",
+    "gpt2", "llama-", "mistral-", "falcon-", "opt-", "t5-", "bart-",
+    "deberta-", "mpnet-", "camembert-", "bloom-", "codellama-",
+    "qwen2-", "gemma-", "phi-", "mixtral-", "starcoder2-", "cohere-",
+    "dbrx-", "phi3-", "qwen-", "yi-", "deepseek-", "baichuan-", "chatglm-"
+)
 
 
 def guess_format(path: str) -> str:
@@ -207,23 +219,50 @@ def load_from_transformers(
     model_name: str,
     device: Optional[torch.device] = None,
     cache_dir: Optional[str] = None,
+    trust_remote_code: bool = False,
+    max_model_size_gb: float = DEFAULT_MAX_MODEL_SIZE_GB,
+    download_timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
 ) -> torch.Tensor:
     """Load embedding weight from a HuggingFace Transformers model.
     
     Args:
         model_name: HuggingFace model identifier (e.g., 'bert-base-uncased').
         device: Target device.
-        cache_dir: Optional cache directory for HF downloads. If None, defaults to '.hf_cache' in project root.
+        cache_dir: Optional cache directory for HF downloads. If None, defaults to HF cache.
+        trust_remote_code: Whether to allow execution of remote code from model repo.
+                          Default False for security. Set True only for trusted models.
+        max_model_size_gb: Maximum allowed model size in GB. Prevents OOM on huge models.
+        download_timeout: Download timeout in seconds.
     
     Returns:
         Tensor of shape (vocab_size, embedding_dim).
+    
+    Raises:
+        ValueError: If model is not in allowlist and trust_remote_code=False.
+        RuntimeError: If model size exceeds max_model_size_gb.
     """
+    # Security: Validate model name against allowlist
+    if not trust_remote_code:
+        model_lower = model_name.lower()
+        if not any(model_lower.startswith(prefix) for prefix in KNOWN_SAFE_MODEL_PREFIXES):
+            raise ValueError(
+                f"Model '{model_name}' not in known safe model allowlist. "
+                f"Set trust_remote_code=True to load anyway (only for trusted sources)."
+            )
+    
     if cache_dir is None:
-        import os
-        # Ensure all downloads are contained within the project folder
-        project_root = os.getcwd()
-        cache_dir = os.path.join(project_root, ".hf_cache")
-        os.makedirs(cache_dir, exist_ok=True)
+        # Use the user-aware HF cache (~/.cache/huggingface) by default;
+        # os.getcwd() is process-stable but varies per invocation and is
+        # rarely what library users expect. Falling back to the cwd-derived
+        # directory only as a last resort preserves old behavior.
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
+        if not os.path.isdir(cache_dir):
+            cache_dir = os.path.join(os.getcwd(), ".hf_cache")
+            os.makedirs(cache_dir, exist_ok=True)
+
+    weight = _load_embedding_only(model_name, cache_dir=cache_dir, device=device, download_timeout=download_timeout)
+    if weight is not None:
+        return weight
 
     try:
         from transformers import AutoModel
@@ -232,14 +271,194 @@ def load_from_transformers(
             "transformers package not found. Install with: pip install transformers"
         )
     
-    model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir, low_cpu_mem_usage=True)
+    # Check model size before loading
+    _check_model_size(model_name, cache_dir, max_model_size_gb, download_timeout)
+    
+    model = AutoModel.from_pretrained(
+        model_name, 
+        cache_dir=cache_dir, 
+        low_cpu_mem_usage=True,
+        trust_remote_code=trust_remote_code,
+    )
     emb = model.get_input_embeddings()
+    if emb is None:
+        raise ValueError(f"Model '{model_name}' has no input embeddings")
     weight = emb.weight.data
+
+    if device:
+        weight = weight.to(device)
     
     logger.info(
         f"Loaded '{model_name}' from HF: shape={tuple(weight.shape)} (cached at {cache_dir})"
     )
-    return weight.to(device) if device else weight
+    return weight
+
+
+def _check_model_size(
+    model_name: str,
+    cache_dir: str,
+    max_size_gb: float,
+    timeout: int,
+) -> None:
+    """Check model size before downloading to prevent OOM."""
+    try:
+        from huggingface_hub import list_repo_files, hf_hub_download
+    except ImportError:
+        logger.warning("huggingface_hub not available, skipping size check")
+        return
+    
+    try:
+        files = list_repo_files(model_name, repo_type="model")
+    except Exception as e:
+        logger.warning(f"Could not list repo files for size check: {e}")
+        return
+    
+    # Find safetensors files
+    safetensor_files = [f for f in files if f.endswith(".safetensors") and "index" not in f]
+    index_files = [f for f in files if f.endswith("model.safetensors.index.json")]
+    
+    total_size = 0
+    if index_files:
+        # Sharded model - check index
+        try:
+            index_path = hf_hub_download(model_name, index_files[0], cache_dir=cache_dir)
+            import json
+            with open(index_path) as f:
+                index_data = json.load(f)
+            weight_map = index_data.get("weight_map", {})
+            # Sum sizes from weight map
+            for safetensor_file in set(weight_map.values()):
+                file_path = hf_hub_download(model_name, safetensor_file, cache_dir=cache_dir)
+                total_size += os.path.getsize(file_path)
+        except Exception as e:
+            logger.warning(f"Could not check sharded model size: {e}")
+    elif safetensor_files:
+        try:
+            for sf in safetensor_files:
+                file_path = hf_hub_download(model_name, sf, cache_dir=cache_dir)
+                total_size += os.path.getsize(file_path)
+        except Exception as e:
+            logger.warning(f"Could not check model size: {e}")
+    
+    size_gb = total_size / (1024 ** 3)
+    if size_gb > max_size_gb:
+        raise RuntimeError(
+            f"Model '{model_name}' size ({size_gb:.1f} GB) exceeds limit ({max_size_gb} GB). "
+            f"Increase max_model_size_gb or use a smaller model."
+        )
+    
+    logger.info(f"Model '{model_name}' size check passed: {size_gb:.2f} GB")
+
+
+# Mapping from model type to the expected embedding weight key in safetensors
+_EMBEDDING_KEYS = {
+    "bert": "embeddings.word_embeddings.weight",
+    "roberta": "roberta.embeddings.word_embeddings.weight",
+    "gpt2": "wte.weight",
+    "llama": "model.embed_tokens.weight",
+    "mistral": "model.embed_tokens.weight",
+    "falcon": "transformer.word_embeddings.weight",
+    "gptj": "transformer.wte.weight",
+    "opt": "model.decoder.embed_tokens.weight",
+    "bloom": "word_embeddings.weight",
+    "t5": "shared.weight",
+    "deberta": "embeddings.word_embeddings.weight",
+    "electra": "electra.embeddings.word_embeddings.weight",
+    "xlm_roberta": "roberta.embeddings.word_embeddings.weight",
+    "albert": "albert.embeddings.word_embeddings.weight",
+    "camembert": "roberta.embeddings.word_embeddings.weight",
+    "distilbert": "distilbert.embeddings.word_embeddings.weight",
+    "mpnet": "mpnet.embeddings.word_embeddings.weight",
+    "qwen2": "model.embed_tokens.weight",
+    "gemma": "model.embed_tokens.weight",
+    "phi3": "model.embed_tokens.weight",
+    "starcoder2": "model.embed_tokens.weight",
+    "cohere": "model.embed_tokens.weight",
+    "dbrx": "wte.weight",
+}
+
+# Alternative key suffixes for fallback detection
+_EMBEDDING_KEY_SUFFIXES = [
+    ".word_embeddings.weight",
+    ".embed_tokens.weight",
+    "wte.weight",
+    ".word_embeddings",
+    "shared.weight",
+    "embed_tokens.weight",
+    "tok_embeddings.weight",
+    "input_embeddings.weight",
+]
+
+
+def _load_embedding_only(
+    model_name: str,
+    cache_dir: Optional[str] = None,
+    device: Optional[torch.device] = None,
+    download_timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
+) -> Optional[torch.Tensor]:
+    """Load only the embedding weight from a HF model without loading the full model.
+    
+    Uses the safetensors index to find and download only the weight file
+    containing the embedding matrix. Falls back to None if detection fails.
+    """
+    import json
+    import os
+
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files
+    except ImportError:
+        return None
+
+    if cache_dir is None:
+        cache_dir = os.path.join(os.getcwd(), ".hf_cache")
+
+    try:
+        files = list_repo_files(model_name, repo_type="model")
+    except Exception:
+        return None
+
+    index_files = [f for f in files if f.endswith("model.safetensors.index.json")]
+    single_files = [f for f in files if f.endswith(".safetensors") and "index" not in f]
+
+    if index_files:
+        index_path = hf_hub_download(model_name, index_files[0], cache_dir=cache_dir)
+        with open(index_path) as f:
+            index_data = json.load(f)
+        weight_map = index_data.get("weight_map", {})
+
+        target_key = _EMBEDDING_KEYS.get(model_name.split("/")[-1].split("-")[0].lower(), None)
+        if target_key is None:
+            for suffix in _EMBEDDING_KEY_SUFFIXES:
+                matches = {k: v for k, v in weight_map.items() if k.endswith(suffix)}
+                if matches:
+                    target_key = list(matches.keys())[0]
+                    break
+        if target_key is None:
+            # Compute file sizes once (was O(n²) disk access in max() comparator).
+            index_dir = os.path.dirname(index_path)
+            def _file_sz(rel: str) -> int:
+                p = os.path.join(index_dir, rel)
+                try:
+                    return os.path.getsize(p)
+                except OSError:
+                    return 0
+            largest_key = max(
+                weight_map,
+                key=lambda k: _file_sz(weight_map[k]),
+            )
+            target_key = largest_key
+
+        if target_key and target_key in weight_map:
+            safetensor_file = weight_map[target_key]
+            safetensor_path = hf_hub_download(model_name, safetensor_file, cache_dir=cache_dir)
+            return load_from_safetensors(safetensor_path, key=target_key, device=device)
+    elif single_files:
+        safetensor_path = hf_hub_download(model_name, single_files[0], cache_dir=cache_dir)
+        weight = load_from_safetensors(safetensor_path, device=device)
+        if weight is not None:
+            return weight
+
+    return None
 
 
 def _resolve_key(state_dict: Dict[str, torch.Tensor], key: str) -> torch.Tensor:
@@ -263,6 +482,9 @@ def load_embedding_matrix(
     key: Optional[str] = None,
     device: Optional[torch.device] = None,
     cache_dir: Optional[str] = None,
+    trust_remote_code: bool = False,
+    max_model_size_gb: float = DEFAULT_MAX_MODEL_SIZE_GB,
+    download_timeout: int = DEFAULT_DOWNLOAD_TIMEOUT,
 ) -> torch.Tensor:
     """Universal loader: detect format and load embedding matrix.
 
@@ -273,6 +495,10 @@ def load_embedding_matrix(
         key: Specific key for torch/safetensors state dicts.
         device: Target device.
         cache_dir: Cache dir for HuggingFace downloads.
+        trust_remote_code: Whether to allow execution of remote code from model repo.
+                          Default False for security. Set True only for trusted models.
+        max_model_size_gb: Maximum allowed model size in GB. Prevents OOM on huge models.
+        download_timeout: Download timeout in seconds.
 
     Returns:
         Tensor of shape (vocab_size, embedding_dim).
@@ -280,6 +506,8 @@ def load_embedding_matrix(
     Raises:
         FileNotFoundError: If path does not exist and can't be loaded from HF.
         ImportError: If required package not installed.
+        ValueError: If model not in allowlist and trust_remote_code=False.
+        RuntimeError: If model size exceeds max_model_size_gb.
     """
     fmt = format or guess_format(source)
 
@@ -302,7 +530,12 @@ def load_embedding_matrix(
                 result = loader()
                 logger.info(f"Auto-detected format '{try_fmt}' for {source}")
                 return result
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Format '{try_fmt}' failed for {source}: {e}")
                 continue
 
-    return load_from_transformers(source, device, cache_dir)
+    return load_from_transformers(
+        source,
+        device,
+        cache_dir,
+    )

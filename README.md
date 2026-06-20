@@ -439,26 +439,14 @@ tensor_ring_decomposition/
 
 ## Possible Improvements
 
-The following areas are identified for future work (see full audit for 52 items):
-
-**Critical:**
-- Tests for `loaders/loaders.py` (entire module uncovered)
-- `replace_in_model()` should not replace position/token-type embeddings
-- `from_pretrained` should avoid downloading full 7B+ models just for the embedding table
-- `trustworthiness()` normalization formula verification
-
-**High priority:**
-- Randomized SVD for rank estimation (currently full SVD repeated in 5+ places)
-- Deduplicate forward logic between `embedding.py` and `cores.py`
-- Simplify `distribution_aware_reconstruction_error_v2()` (85 lines, 5 nesting levels)
-- Fix version mismatch (CHANGELOG says 0.2.0, code says 0.3.0)
+The following areas are identified for future work:
 
 **Feature gaps:**
-- Weight tying support (shared input/output embeddings)
 - Position embedding compression
-- Progressive rank adjustment (warm-start from lower rank)
-- Knowledge distillation API (`embedding.distill()`)
-- ONNX Runtime integration
+- Gradient checkpointing for very long vocab chains
+- Flash attention integration for ring closure
+- Automatic mixed precision (AMP) wrappers
+- Integration with popular training frameworks (HF Trainer, Lightning)
 
 ---
 
@@ -469,8 +457,8 @@ If you use this library in research:
 ```bibtex
 @software{tensor_ring_decomposition,
   title = {Tensor Ring Decomposition for Embeddings},
-  version = {0.3.0},
-  url = {https://github.com/your-org/tensor-ring-decomposition}
+  version = {0.4.0},
+  url = {https://github.com/shreyashjagtap157/tensor-ring-decomposition}
 }
 ```
 

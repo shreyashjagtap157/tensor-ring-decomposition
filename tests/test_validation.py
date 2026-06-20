@@ -44,7 +44,7 @@ class TestValidateCompatibility:
     def test_incompatible(self):
         emb = TensorRingEmbedding(100, 32, rank=4)
         linear = nn.Linear(64, 16)
-        with pytest.raises(ValueError, match="expects input dim"):
+        with pytest.raises(ValueError, match="in_features does not match"):
             validate_compatibility(emb, linear)
 
     def test_no_linear_layer(self):

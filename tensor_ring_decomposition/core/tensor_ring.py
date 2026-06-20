@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import List
 
 import torch
+
+logger = logging.getLogger(__name__)
 
 
 class TRTensor:
@@ -29,6 +32,7 @@ class TRTensor:
 
         WARNING: Materialises the full (V, D) matrix.  Debugging only.
         """
+        logger.warning("to_tensor() materializes the full V×D matrix — use only for debugging")
         # ----------------------- embedding chain -------------------------
         emb = self.emb_cores[0]                     # (D_0, R_0, R_1)
         for core in self.emb_cores[1:]:             # (D_i, R_i, R_{i+1})

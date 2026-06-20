@@ -1,112 +1,68 @@
-"""Contraction path computation and execution using opt_einsum."""
+"""Contraction path computation and execution for tensor ring decomposition."""
 
 from __future__ import annotations
 
-import threading
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional
 
-import opt_einsum as oe
 import torch
 
-class ShapeView:
-    """Lightweight wrapper so opt_einsum accepts shape tuples as tensors."""
-
-    __slots__ = ("shape",)
-
-    def __init__(self, shape: Tuple[int, ...]):
-        self.shape = shape
+from .factorization import compute_mixed_radix_strides
 
 
-class ContractionPathCache:
-    """Thread-safe, deterministic cache for contraction paths.
+def gather_vocab_cores(
+    flat_indices: torch.Tensor,
+    vocab_cores: List[torch.Tensor],
+    factor_sizes: List[int],
+    strides: Optional[List[int]] = None,
+    *,
+    raise_oob: bool = False,
+) -> torch.Tensor:
+    """Decompose flat indices via mixed-radix, gather core slices, chain via bmm.
 
-    Stores paths keyed by (equation string, shape tuples).
-    Path is computed once with dummy tensors and reused forever.
+    Args:
+        flat_indices: (B,) flat token indices.
+        vocab_cores: List of (V_i, R_i, R_{i+1}) core tensors.
+        factor_sizes: List of vocab factor sizes.
+        strides: Precomputed strides. If None, computed from factor_sizes.
+        raise_oob: When True, raise IndexError if any factor index is out of
+            range. When False (default), apply a (no-op for in-range ids)
+            clamp to keep behavior backward-compatible with v0.4.0.
+
+    Returns:
+        (B, R_0, R_k) chained result.
     """
+    k = len(vocab_cores)
+    if strides is None:
+        strides = compute_mixed_radix_strides(factor_sizes)
+    factor_indices: List[torch.Tensor] = []
+    remaining = flat_indices
+    for i in range(k):
+        if i < k - 1:
+            fi = remaining // strides[i]
+            remaining = remaining % strides[i]
+        else:
+            fi = remaining
+        if raise_oob:
+            if flat_indices.numel() and (
+                fi.min().item() < 0 or fi.max().item() >= factor_sizes[i]
+            ):
+                raise IndexError(
+                    f"Vocabulary factor index out of range: factor {i} has "
+                    f"size {factor_sizes[i]} but factor indices in "
+                    f"[{fi.min().item()}, {fi.max().item()}] encountered."
+                )
+        else:
+            # Hot path. Clamp is a no-op on valid token ids, and historically
+            # silently coerced malformed ids to the last factor row. API users
+            # can opt into ``raise_oob=True`` to surface this loudly.
+            fi = fi.clamp(0, factor_sizes[i] - 1)
+        factor_indices.append(fi)
 
-    _cache: Dict[
-        Tuple[str, Tuple[Tuple[int, ...], ...]],
-        Tuple[List[Tuple[int, int]], str],
-    ] = {}
-    _lock = threading.Lock()
-
-    @classmethod
-    def get_path(
-        cls,
-        eq: str,
-        tensors_or_shapes: List[torch.Tensor | Tuple[int, ...]],
-        optimize: str = "greedy",
-    ) -> Tuple[List[Tuple[int, int]], str]:
-        """Get cached contraction path or compute and cache it.
-
-        Accepts either actual tensors or shape tuples.  Shape tuples are
-        wrapped so opt_einsum can read the ``shape`` attribute.
-
-        Returns:
-            (path, path_info_str) pair.
-        """
-        # Normalise every entry to a plain shape tuple
-        shapes: List[Tuple[int, ...]] = []
-        operands: list = []
-        for entry in tensors_or_shapes:
-            if isinstance(entry, torch.Tensor):
-                shapes.append(tuple(entry.shape))
-                operands.append(entry)
-            else:
-                shapes.append(tuple(entry))
-                operands.append(ShapeView(entry))
-
-        key = (eq, tuple(shapes))
-
-        with cls._lock:
-            if key not in cls._cache:
-                path, path_info = oe.contract_path(eq, *operands, optimize=optimize)
-                cls._cache[key] = (path, str(path_info))
-
-        return cls._cache[key]
-
-    @classmethod
-    def clear(cls) -> None:
-        """Clear all cached paths."""
-        with cls._lock:
-            cls._cache.clear()
-
-
-def compute_vocab_chain_expression(
-    vocab_core_shapes: List[Tuple[int, int, int]],
-    rank: int,
-) -> oe.contract_expression:
-    """Precompute contraction path for vocab cores.
-    Result: (B, R, R) chain result.
-    """
-    k = len(vocab_core_shapes)
-    # Use distinct single characters for indices.
-    # Batch: 'b', Ranks: 'a', 'c', 'e', 'g'... (odd alphabet)
-    rank_chars = "acegikmoqsuwy"
-    operands = [f"b{rank_chars[i]}{rank_chars[i+1]}" for i in range(k)]
-    eq = ",".join(operands) + f"->b{rank_chars[0]}{rank_chars[k]}"
-
-    shapes = [(1, s[1], s[2]) for s in vocab_core_shapes]
-    return oe.contract_expression(eq, *shapes)
-
-
-def compute_emb_precontraction_expression(
-    emb_core_shapes: List[Tuple[int, int, int]],
-) -> oe.contract_expression:
-    """Precompute contraction path for embedding cores.
-    Result: (R0, D, Rm) tensor.
-    """
-    m = len(emb_core_shapes)
-    # Dim indices: 'f', 'h', 'j', 'l'... (even alphabet)
-    # Rank indices: 'a', 'c', 'e', 'g'... (odd alphabet)
-    dim_chars = "fhjlnprstvwxyz"
-    rank_chars = "acegikmoqsuwy"
-    
-    operands = [f"{dim_chars[i]}{rank_chars[i]}{rank_chars[i+1]}" for i in range(m)]
-    eq = ",".join(operands) + f"{rank_chars[0]}" + "".join(dim_chars[:m]) + f"{rank_chars[m]}"
-
-    shapes = [s for s in emb_core_shapes]
-    return oe.contract_expression(eq, *shapes)
+    gathered = [vocab_cores[i][factor_indices[i]] for i in range(k)]
+    result = gathered[0]
+    for cg in gathered[1:]:
+        result = torch.bmm(result, cg)
+    return result
 
 def compute_emb_precontraction(emb_cores: List[torch.Tensor]) -> torch.Tensor:
     """Compute embedding cores precontraction via sequential bmm.
@@ -137,40 +93,27 @@ def compute_emb_precontraction(emb_cores: List[torch.Tensor]) -> torch.Tensor:
 def ring_closure(
     vocab_result: torch.Tensor,
     emb_contraction: torch.Tensor,
-    use_efficient: bool = True,
 ) -> torch.Tensor:
     """Combine vocab chain result with precontracted emb contraction.
+
+    Uses the einsum implementation exclusively (fast & numerically stable).
+    The legacy loop-based ``_ring_closure_efficient`` has been removed; the
+    ``use_efficient`` flag is also removed from the public signature.
 
     Args:
         vocab_result: (B, R, R)
         emb_contraction: (R, D, R)
-        use_efficient: Whether to use memory-efficient loop
 
     Returns:
         (B, D) output embeddings
     """
-    if use_efficient:
-        return _ring_closure_efficient(vocab_result, emb_contraction)
-    else:
-        return _ring_closure_einsum(vocab_result, emb_contraction)
+    return _ring_closure_einsum(vocab_result, emb_contraction)
 
 
-def _ring_closure_efficient(
-    vocab_result: torch.Tensor,
-    emb_contraction: torch.Tensor,
-) -> torch.Tensor:
-    """Memory-efficient ring closure via R-dimension loop."""
-    R = vocab_result.shape[1]
-    B = vocab_result.shape[0]
-    D = emb_contraction.shape[1]
-    device = vocab_result.device
-    dtype = vocab_result.dtype
-
-    output = torch.zeros(B, D, device=device, dtype=dtype)
-    for r in range(R):
-        output += torch.mm(vocab_result[:, r, :], emb_contraction[:, :, r])
-
-    return output
+# NOTE: The original memory‑efficient loop implementation (`_ring_closure_efficient`) has been removed.
+# The `ring_closure` function now always uses the efficient einsum implementation, which is the
+# recommended path for all rank sizes (R ≤ 256). Keeping the legacy loop would add maintenance
+# overhead without any performance benefit for typical workloads.
 
 
 def _ring_closure_einsum(

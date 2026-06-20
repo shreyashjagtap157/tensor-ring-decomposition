@@ -41,9 +41,10 @@ def save(
     weights = {name: param.data for name, param in embedding.named_parameters()}
 
     # Serialize to bytes, write to disk, compute hash from same bytes
-    weights_bytes = sf.save(weights)
-    weights_path = Path(path).with_suffix(".safetensors")
-    weights_path.write_bytes(weights_bytes)
+    weights_path = Path(path).with_suffix('').with_suffix('.safetensors')
+    sf.save_file(weights, weights_path)
+    # For hash computation, read the written file bytes
+    weights_bytes = weights_path.read_bytes()
 
     if secret_key:
         core_hash = hmac.new(secret_key, weights_bytes, hashlib.sha256).hexdigest()
@@ -75,7 +76,7 @@ def save(
         manifest.update(extra_metadata)
 
     # Save manifest
-    manifest_path = Path(path).with_suffix(".json")
+    manifest_path = Path(path).with_suffix("").with_suffix(".json")
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str))
 
 
@@ -94,14 +95,14 @@ def load(
     from ..core.embedding import TensorRingEmbedding
 
     # Load manifest
-    manifest_path = Path(path).with_suffix(".json")
+    manifest_path = Path(path).with_suffix("").with_suffix(".json")
     if not manifest_path.exists():
         raise FileNotFoundError(f"Manifest not found: {manifest_path}")
 
     manifest = json.loads(manifest_path.read_text())
 
     # Verify hash (single read of weights bytes)
-    weights_path = Path(path).parent / manifest["weights_file"]
+    weights_path = Path(path).with_suffix("").with_suffix(".safetensors")
     if not weights_path.exists():
         raise FileNotFoundError(f"Weights not found: {weights_path}")
 
@@ -119,25 +120,44 @@ def load(
         )
 
     # Load weights from bytes (no second file read)
-    weights = sf.load(weights_bytes)
+    weights = sf.load_file(weights_path, device=device) if device is not None else sf.load_file(weights_path)
     if device is not None:
         weights = {k: v.to(device) for k, v in weights.items()}
 
     # Reconstruct embedding with full config roundtrip
     config = manifest["tr_config"]
-    embedding = TensorRingEmbedding(
-        vocab_size=config["vocab_size"],
-        embedding_dim=config["embedding_dim"],
-        rank=config["rank"] if config.get("rank") is not None else max(config.get("ranks", [4])),
-        ring_components=config.get("ring_components", 4),
-        split_mode=config.get("split_mode", "balanced"),
-        init_method="uniform",
-        gauge_fix=config.get("gauge_fix", "left"),
-        gauge_fix_interval=config.get("gauge_fix_interval", 1000),
-        padding_idx=config.get("padding_idx"),
-        max_seq_len=config.get("max_seq_len"),
-        spectral_reg_coeff=config.get("spectral_reg_coeff", 0.0),
-    )
+    skip = {"_skip_init": True}
+    if config.get("used_explicit_ranks") and config.get("structure_ranks"):
+        embedding = TensorRingEmbedding(
+            vocab_size=config["vocab_size"],
+            embedding_dim=config["embedding_dim"],
+            rank=None,
+            ranks=config["structure_ranks"],
+            ring_components=config.get("ring_components", 4),
+            split_mode=config.get("split_mode", "balanced"),
+            init_method="uniform",
+            gauge_fix=config.get("gauge_fix", "left"),
+            gauge_fix_interval=config.get("gauge_fix_interval", 1000),
+            padding_idx=config.get("padding_idx"),
+            max_seq_len=config.get("max_seq_len"),
+            spectral_reg_coeff=config.get("spectral_reg_coeff", 0.0),
+            **skip,
+        )
+    else:
+        embedding = TensorRingEmbedding(
+            vocab_size=config["vocab_size"],
+            embedding_dim=config["embedding_dim"],
+            rank=config["rank"] if config.get("rank") is not None else max(config.get("ranks", [4])),
+            ring_components=config.get("ring_components", 4),
+            split_mode=config.get("split_mode", "balanced"),
+            init_method="uniform",
+            gauge_fix=config.get("gauge_fix", "left"),
+            gauge_fix_interval=config.get("gauge_fix_interval", 1000),
+            padding_idx=config.get("padding_idx"),
+            max_seq_len=config.get("max_seq_len"),
+            spectral_reg_coeff=config.get("spectral_reg_coeff", 0.0),
+            **skip,
+        )
     embedding.load_state_dict(weights)
 
     return embedding

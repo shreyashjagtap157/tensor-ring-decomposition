@@ -116,6 +116,15 @@ class TestTensorRingEmbedding:
         norms = emb.spectral_norms()
         assert len(norms) > 0
 
+    def test_split_mode_param_balanced(self):
+        emb = TensorRingEmbedding(1000, 256, rank=8, split_mode="param_balanced")
+        indices = torch.randint(0, 1000, (4, 16))
+        out = emb(indices)
+        assert out.shape == (4, 16, 256)
+        emb = TensorRingEmbedding(100, 32, rank=4)
+        norms = emb.spectral_norms()
+        assert len(norms) > 0
+
     def test_reconstruct(self):
         emb = TensorRingEmbedding(100, 32, rank=4)
         matrix = emb.reconstruct()
