@@ -27,12 +27,23 @@ class QualityGate:
 
         Checks each metric against baseline. If any drops > threshold,
         returns False and logs the failure.
+
+        Handles edge cases:
+        - Zero baseline: uses absolute drop instead of relative
+        - Negative baseline: compares absolute change direction
+        - No matching metrics: returns False (avoids silent pass)
         """
+        metrics_checked = 0
         for key, baseline_value in self.baseline.items():
             if key not in current_metrics:
                 continue
+            metrics_checked += 1
             current_value = current_metrics[key]
-            drop = (baseline_value - current_value) / abs(baseline_value)
+            abs_base = abs(baseline_value)
+            if abs_base > 1e-12:
+                drop = (baseline_value - current_value) / abs_base
+            else:
+                drop = abs(baseline_value - current_value)
 
             if drop > self.threshold:
                 logger.error(
@@ -41,6 +52,16 @@ class QualityGate:
                 )
                 self.triggered = True
                 return False
+
+        if metrics_checked == 0:
+            log_fn = logger.info if not self.triggered else logger.warning
+            log_fn(
+                f"QualityGate: No metrics from baseline matched current_metrics "
+                f"(baseline keys={list(self.baseline.keys())}, "
+                f"current keys={list(current_metrics.keys())})"
+            )
+            self.triggered = True
+            return False
 
         return True
 

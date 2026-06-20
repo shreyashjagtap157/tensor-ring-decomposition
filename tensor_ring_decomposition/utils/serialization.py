@@ -31,18 +31,20 @@ def save(
     Creates two files:
     - {path}.safetensors: Weights
     - {path}.json: Manifest with metadata and hash
+
+    Weights are serialized to bytes once; the same bytes are written to
+    disk and used for hash computation (eliminates double I/O).
     """
     import safetensors.torch as sf
 
     # Collect weights
     weights = {name: param.data for name, param in embedding.named_parameters()}
 
-    # Save weights as safetensors
+    # Serialize to bytes, write to disk, compute hash from same bytes
+    weights_bytes = sf.save(weights)
     weights_path = Path(path).with_suffix(".safetensors")
-    sf.save_file(weights, str(weights_path))
+    weights_path.write_bytes(weights_bytes)
 
-    # Compute hash
-    weights_bytes = weights_path.read_bytes()
     if secret_key:
         core_hash = hmac.new(secret_key, weights_bytes, hashlib.sha256).hexdigest()
         hash_type = "hmac-sha256"
@@ -85,6 +87,7 @@ def load(
     """Load TR embedding from safetensors + manifest.
 
     Verifies hash before loading. Uses safetensors (not torch.load).
+    Weights file is read once; bytes are reused for hash verification.
     """
     import safetensors.torch as sf
 
@@ -97,7 +100,7 @@ def load(
 
     manifest = json.loads(manifest_path.read_text())
 
-    # Verify hash
+    # Verify hash (single read of weights bytes)
     weights_path = Path(path).parent / manifest["weights_file"]
     if not weights_path.exists():
         raise FileNotFoundError(f"Weights not found: {weights_path}")
@@ -115,15 +118,17 @@ def load(
             f"This checkpoint may have been tampered with."
         )
 
-    # Load weights (safetensors - no code execution)
-    weights = sf.load_file(str(weights_path), device=device)
+    # Load weights from bytes (no second file read)
+    weights = sf.load(weights_bytes)
+    if device is not None:
+        weights = {k: v.to(device) for k, v in weights.items()}
 
     # Reconstruct embedding with full config roundtrip
     config = manifest["tr_config"]
     embedding = TensorRingEmbedding(
         vocab_size=config["vocab_size"],
         embedding_dim=config["embedding_dim"],
-        rank=config["rank"],
+        rank=config["rank"] if config.get("rank") is not None else max(config.get("ranks", [4])),
         ring_components=config.get("ring_components", 4),
         split_mode=config.get("split_mode", "balanced"),
         init_method="uniform",

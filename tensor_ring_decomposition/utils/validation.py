@@ -19,7 +19,10 @@ def validate_indices(
     """Validate token indices are within bounds.
 
     Handles empty tensors gracefully (always passes for 0-element tensors).
+    Skips validation during TorchScript tracing to avoid TracerWarnings.
     """
+    if torch.jit.is_tracing():
+        return
     if indices.numel() == 0:
         return
     if indices.min() < 0:

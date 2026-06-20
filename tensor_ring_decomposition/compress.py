@@ -7,7 +7,7 @@ from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 
-from .core.embedding import TensorRingEmbedding, AutotuneResult, ExportFormat
+from .core.embedding import TensorRingEmbedding
 from .models.registry import ModelProfile, ModelRegistry
 from .loaders.loaders import load_embedding_matrix
 
@@ -71,9 +71,10 @@ def compress(
                 try:
                     matrix = load_embedding_matrix(source, device=device)
                 except Exception as e:
-                    logger.warning(f"Failed to load matrix for {source}: {e}. Falling back to uniform init.")
-                    # If loading fails, we force uniform init
-                    # We'll handle this by setting init_method to "uniform" below
+                    if init_method in ("svd", "tr_svd", "als", "distribution_aware"):
+                        logger.warning(f"Failed to load matrix for {source}: {e}. Falling back to uniform init. "
+                                       f"This may produce lower-quality embeddings. "
+                                       f"To avoid this, ensure the model is accessible or provide a tensor directly.")
                 
         if profile is None:
             # Assume it's a file path or direct HF model name

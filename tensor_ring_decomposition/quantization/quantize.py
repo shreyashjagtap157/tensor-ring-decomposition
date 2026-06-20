@@ -20,6 +20,21 @@ if TYPE_CHECKING:
     from ..core.embedding import TensorRingEmbedding
 
 
+class STERound(Function):
+    """Straight-Through Estimator for rounding.
+
+    Forward: round(x)
+    Backward: identity (gradient passes through unchanged)
+    """
+    @staticmethod
+    def forward(ctx, x):
+        return torch.round(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output
+
+
 class LSQQuantize(Function):
     """Learned Step Size Quantization (ICLR 2020).
 
@@ -27,21 +42,33 @@ class LSQQuantize(Function):
     This converges faster and to better minima than data-dependent scaling.
 
     Forward: q = round(x / s) * s   (STE: backward passes gradient unchanged)
-    The scale gradient is: dL/ds = dL/dx * sign(s - |x|) / sqrt(N)
+    Scale gradient: dL/ds = dL/dq · (round(x/s) - x/s)  (LSQ formula)
     """
     @staticmethod
     def forward(ctx, x, scale, ste=True):
+        s = scale
+        orig_ndim = s.ndim
+        if s.ndim == 1:
+            s = s.view(-1, 1, 1)
+        ctx.save_for_backward(x, s)
+        ctx.orig_scale_ndim = orig_ndim
         if ste:
-            q = torch.round(x / scale).clamp(-128, 127)
-            return q * scale
-        else:
-            s = scale.clamp(min=1e-8)
-            q = (x / s).round().clamp(-128, 127)
+            q = STERound.apply(x / s).clamp(-128, 127)
             return q * s
+        else:
+            s_clamped = s.clamp(min=1e-8)
+            q = STERound.apply(x / s_clamped).clamp(-128, 127)
+            return q * s_clamped
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output, None, None
+        x, s = ctx.saved_tensors
+        grad_x = grad_output
+        grad_scale = grad_output * (torch.round((x / s).detach()) - (x / s).detach())
+        if grad_scale.ndim > ctx.orig_scale_ndim:
+            dims = tuple(range(ctx.orig_scale_ndim, grad_scale.ndim))
+            grad_scale = grad_scale.sum(dim=dims)
+        return grad_x, grad_scale, None
 
 
 def _quantize_tensor(t: torch.Tensor) -> Tuple[torch.Tensor, float, int]:
@@ -88,11 +115,14 @@ class NonNegativeClamp(Function):
     """Clamp gradients while clamping values to non-negative."""
     @staticmethod
     def forward(ctx, x):
+        ctx.save_for_backward(x)
         return x.clamp(min=0)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output.clone()
+        x, = ctx.saved_tensors
+        grad = grad_output.masked_fill(x < 0, 0.0)
+        return grad
 
 
 class QuantizedTensorRingEmbedding(nn.Module):
@@ -117,7 +147,6 @@ class QuantizedTensorRingEmbedding(nn.Module):
         self.padding_idx = embedding.padding_idx
         self._dtype = embedding._dtype
         self._vocab_strides = embedding._vocab_strides
-        self._emb_strides = embedding._emb_strides
         self._validate_indices_flag = embedding._validate_indices_flag
         self._max_seq_len = embedding._max_seq_len
         self.qat = qat
@@ -162,7 +191,7 @@ class QuantizedTensorRingEmbedding(nn.Module):
             else:
                 absmax = core.data.abs().max()
                 init_scale = (absmax / 127.0).clamp(min=1e-8)
-                param = nn.Parameter(torch.tensor(init_scale, device=core.device))
+                param = nn.Parameter(init_scale.detach().clone())
             self._vocab_lsq_scales.append(param)
 
         for core in embedding.cores.emb_cores:
@@ -173,7 +202,7 @@ class QuantizedTensorRingEmbedding(nn.Module):
             else:
                 absmax = core.data.abs().max()
                 init_scale = (absmax / 127.0).clamp(min=1e-8)
-                param = nn.Parameter(torch.tensor(init_scale, device=core.device))
+                param = nn.Parameter(init_scale.detach().clone())
             self._emb_lsq_scales.append(param)
 
         self._lsq_initialized = True
@@ -181,17 +210,10 @@ class QuantizedTensorRingEmbedding(nn.Module):
     def _lsq_quantize_core(self, core: torch.Tensor, scale: nn.Parameter) -> torch.Tensor:
         """Apply LSQ quantization with learnable scale.
         
-        Forward: round(x / s) * s
-        Gradient: pass through STE (identity on backward pass)
-        Scale update: dL/ds approximation via STE
+        Forward: round(x / s) * s via LSQQuantize Function
+        Scale update: dL/ds = -(x / s²) * dL/dq via backward
         """
-        # Ensure scale is broadcastable to (dim, rank, rank)
-        s = scale
-        if s.ndim == 1:
-            s = s.view(-1, 1, 1)
-            
-        q = torch.round(core / s).clamp(-128, 127)
-        return q * s
+        return LSQQuantize.apply(core, scale, True)
 
     def quantize(self, embedding: "TensorRingEmbedding") -> None:
         """PTQ: Quantize all cores from a TR embedding to int8."""
@@ -248,10 +270,10 @@ class QuantizedTensorRingEmbedding(nn.Module):
                 for i, core in enumerate(vocab_cores):
                     if not self._per_channel:
                         scale = core.data.abs().max() / 127.0
-                        core_q = torch.round(core / scale).clamp(-128, 127) * scale
+                        core_q = STERound.apply(core / scale).clamp(-128, 127) * scale
                     else:
                         scale = core.data.abs().amax(dim=tuple(range(1, core.data.ndim))) / 127.0
-                        core_q = torch.round(core / scale.view(-1, 1, 1)).clamp(-128, 127) * scale.view(-1, 1, 1)
+                        core_q = STERound.apply(core / scale.view(-1, 1, 1)).clamp(-128, 127) * scale.view(-1, 1, 1)
                     gathered.append(core_q[factor_indices[i]])
 
                 result = gathered[0]
@@ -262,10 +284,10 @@ class QuantizedTensorRingEmbedding(nn.Module):
                 for core in emb_cores_list:
                     if not self._per_channel:
                         scale = core.data.abs().max() / 127.0
-                        core_q = torch.round(core / scale).clamp(-128, 127) * scale
+                        core_q = STERound.apply(core / scale).clamp(-128, 127) * scale
                     else:
                         scale = core.data.abs().amax(dim=tuple(range(1, core.data.ndim))) / 127.0
-                        core_q = torch.round(core / scale.view(-1, 1, 1)).clamp(-128, 127) * scale.view(-1, 1, 1)
+                        core_q = STERound.apply(core / scale.view(-1, 1, 1)).clamp(-128, 127) * scale.view(-1, 1, 1)
                     q_emb_cores.append(core_q)
 
             from ..core.contraction import compute_emb_precontraction
@@ -300,10 +322,6 @@ class QuantizedTensorRingEmbedding(nn.Module):
         cores = [self._dequantize_emb_core(i) for i in range(len(self._q_emb_cores))]
         return compute_emb_precontraction(cores)
 
-    def _dequantize_vocab_core(self, idx: int) -> torch.Tensor:
-        q, s = self._q_vocab_cores[idx], self._vocab_scales[idx]
-        return q.float() * s.view(-1, 1, 1) if isinstance(s, torch.Tensor) and s.ndim > 0 else q.float() * s
-
     def _dequantize_emb_core(self, idx: int) -> torch.Tensor:
         q, s = self._q_emb_cores[idx], self._emb_scales[idx]
         return q.float() * s.view(-1, 1, 1) if isinstance(s, torch.Tensor) and s.ndim > 0 else q.float() * s
@@ -319,12 +337,27 @@ class QuantizedTensorRingEmbedding(nn.Module):
     @property
     def compression_ratio(self) -> float:
         dense = self.vocab_size * self.embedding_dim
-        q_params = sum(p.numel() for p in self.parameters()) if self.qat else \
-                   sum(q.numel() for q in self._q_vocab_cores) + sum(q.numel() for q in self._q_emb_cores)
-        return dense / q_params if q_params > 0 else 1.0
+        if self.qat:
+            q_params = sum(p.numel() for p in self.parameters())
+        elif not self._quantized:
+            raise RuntimeError("Must call quantize() before accessing compression_ratio")
+        else:
+            q_params = sum(q.numel() for q in self._q_vocab_cores) + sum(q.numel() for q in self._q_emb_cores)
+        if q_params <= 0:
+            return float('inf')
+        return dense / q_params
 
     @property
     def bits_per_parameter(self) -> float:
-        total = sum(q.numel() for q in self._q_vocab_cores) + sum(q.numel() for q in self._q_emb_cores) if not self.qat else \
-                sum(p.numel() for p in self.parameters())
-        return total * 8.0 / sum(p.numel() for p in self.parameters()) if total > 0 else 32.0
+        if self.qat:
+            total_params = sum(p.numel() for p in self.parameters())
+            if total_params <= 0:
+                return 32.0
+            scale_params = sum(s.numel() for s in self._vocab_lsq_scales) + sum(s.numel() for s in self._emb_lsq_scales) if self.lsq else 0
+            core_params = total_params - scale_params
+            effective_bits = (core_params * 8.0 + scale_params * 32.0) / total_params
+            return effective_bits
+        elif not self._quantized:
+            raise RuntimeError("Must call quantize() before accessing bits_per_parameter")
+        total = sum(q.numel() for q in self._q_vocab_cores) + sum(q.numel() for q in self._q_emb_cores)
+        return 8.0 if total > 0 else 32.0

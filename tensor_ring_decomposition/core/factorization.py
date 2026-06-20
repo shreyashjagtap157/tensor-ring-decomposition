@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -13,8 +14,8 @@ def factorize_dimension(dim: int, n_factors: int) -> List[int]:
     Strategy: Greedy near-equal product.
 
     Examples:
-        factorize_dimension(50000, 4) -> [9, 9, 9, 68]
-        factorize_dimension(768, 4) -> [3, 4, 8, 8]
+        factorize_dimension(50000, 4) -> [10, 10, 20, 25]
+        factorize_dimension(768, 4) -> [4, 6, 4, 8]
         factorize_dimension(100, 2) -> [10, 10]
 
     Raises:
@@ -46,14 +47,19 @@ def factorize_dimension(dim: int, n_factors: int) -> List[int]:
     return factors
 
 
-def find_best_factorization(n: int, k: int) -> List[int]:
-    """Find the most balanced factorization of n into k factors."""
+@functools.lru_cache(maxsize=None)
+def _find_best_factors(n: int, k: int) -> Tuple[int, ...]:
+    """Memoized recursive search for most balanced factorization.
+    
+    Returns tuple of factors sorted in their computed order (preserving
+    positional semantics for TR cores).
+    """
     if k == 0:
-        return []
+        return ()
     if k == 1:
-        return [n]
+        return (n,)
 
-    # Find all divisors of n
+    # Find divisors up to sqrt(n)
     divisors = []
     for i in range(1, int(math.isqrt(n)) + 1):
         if n % i == 0:
@@ -62,27 +68,32 @@ def find_best_factorization(n: int, k: int) -> List[int]:
                 divisors.append(n // i)
     divisors.sort()
 
-    target = n ** (1.0 / k)
-    best_factors = None
+    best_factors: Optional[Tuple[int, ...]] = None
     best_max = float("inf")
 
-    # Greedy / recursive search for balanced factors
     for d in divisors:
-        # Pruning: if d itself is already worse than the best max, skip
         if d >= best_max:
             continue
-        sub = find_best_factorization(n // d, k - 1)
+        sub = _find_best_factors(n // d, k - 1)
         if sub:
-            factors = [d] + sub
+            factors = (d,) + sub
             max_f = max(factors)
             if max_f < best_max:
                 best_max = max_f
                 best_factors = factors
 
     if best_factors is None:
-        # Fallback to standard factorization
-        return factorize_dimension(n, k)
-    return sorted(best_factors)
+        return tuple(factorize_dimension(n, k))
+    return best_factors
+
+
+def find_best_factorization(n: int, k: int) -> List[int]:
+    """Find the most balanced factorization of n into k factors.
+    
+    Uses memoized recursive search over divisors. Results are cached
+    across calls for the same (n, k) pair.
+    """
+    return list(_find_best_factors(n, k))
 
 
 def find_highly_factorable_dim(
@@ -118,22 +129,41 @@ def find_highly_factorable_dim(
     if best_max_factor <= 2.0 * target:
         return dim, best_factors
 
-    # Search candidates from dim up to max_padded
+    # Search candidates using divisor-based stepping.
+    # The key insight: for each candidate, the best factorization's max factor
+    # divides the candidate. We only need to check candidates that have small
+    # divisors, skipping prime numbers and nearly-prime numbers.
     for candidate in range(dim, max_padded + 1):
+        # Quick pre-filter: skip primes and near-primes
+        sqrt_c = int(math.isqrt(candidate))
+        has_small_divisor = any(candidate % d == 0 for d in range(2, min(sqrt_c, 50) + 1))
+        if not has_small_divisor and candidate > dim:
+            continue
+
         factors = find_best_factorization(candidate, n_factors)
         max_f = max(factors)
-        # Score candidates preferring smaller max factor, and smaller candidate (less padding)
-        # We give a strong weight to reducing the max factor
         if max_f < best_max_factor:
             best_max_factor = max_f
             best_dim = candidate
             best_factors = factors
 
-            # If we've hit a nearly perfect balance, we can stop early
             if best_max_factor <= 1.2 * target:
                 break
 
     return best_dim, best_factors
+
+
+def compute_mixed_radix_strides(factors: List[int]) -> List[int]:
+    """Compute strides for mixed-radix decomposition.
+
+    strides[i] = product of factors[i+1:]
+    Uses single reverse pass (O(n) instead of O(n²)).
+    """
+    n = len(factors)
+    strides = [1] * n
+    for i in range(n - 2, -1, -1):
+        strides[i] = strides[i + 1] * factors[i + 1]
+    return strides
 
 
 @dataclass
@@ -204,11 +234,17 @@ def compute_ring_structure(
         vocab_factors = factorize_dimension(vocab_size, k)
         emb_factors = factorize_dimension(embedding_dim, m)
 
-    if ranks is not None and len(ranks) < ring_components + 1:
-        raise ValueError(
-            f"ranks length ({len(ranks)}) must be at least "
-            f"ring_components+1 ({ring_components + 1})"
-        )
+    if ranks is not None:
+        if len(ranks) < ring_components + 1:
+            raise ValueError(
+                f"ranks length ({len(ranks)}) must be at least "
+                f"ring_components+1 ({ring_components + 1})"
+            )
+        if ranks[0] != ranks[-1]:
+            raise ValueError(
+                f"ranks[0] ({ranks[0]}) must equal ranks[-1] ({ranks[-1]}) "
+                f"for tensor ring closure"
+            )
     if ranks is None:
         ranks = [rank] * (k + m + 1)
 
